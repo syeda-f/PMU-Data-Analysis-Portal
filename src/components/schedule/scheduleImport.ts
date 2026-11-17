@@ -1,10 +1,11 @@
 import * as XLSX from "xlsx";
-import { prerequisitePairs } from "./prerequisiteData";
+import { prerequisitePairs, type PrerequisitePair } from "./prerequisiteData";
 import { ccesCourseCatalog } from "./courseCatalogData";
 import { collegeProfessors } from "./collegeProfessors";
+import { blockConflictRules, type BlockConflictRule } from "./scheduleConstraintData";
 
 export type Campus = "Female" | "Male";
-export type ConflictType = "room" | "instructor" | "course" | "capacity" | "prerequisite";
+export type ConflictType = "room" | "instructor" | "course" | "capacity" | "prerequisite" | "block";
 
 export type ScheduleCourse = {
   id: string;
@@ -24,6 +25,7 @@ export type ScheduleCourse = {
   available: number;
   status: "Open" | "Closed";
   session: string;
+  semester?: "F" | "S";
   conflicts: ConflictType[];
   conflictDetails?: string[];
 };
@@ -122,19 +124,33 @@ export function canonicalCourseTitle(code: string, title: string) {
   }) ?? title;
 }
 
-const normalizedPrerequisites = prerequisitePairs.map((pair) => ({
-  course: normalizeCourseTitle(pair.course),
-  prerequisite: normalizeCourseTitle(pair.prerequisite),
-}));
-
-function isPrerequisitePair(first: ScheduleCourse, second: ScheduleCourse) {
+function isPrerequisitePair(first: ScheduleCourse, second: ScheduleCourse, pairs: readonly PrerequisitePair[]) {
   if (first.college !== "CCES" || second.college !== "CCES") return false;
   const firstTitle = normalizeCourseTitle(first.name);
   const secondTitle = normalizeCourseTitle(second.name);
-  return normalizedPrerequisites.some((pair) =>
-    (pair.course === firstTitle && pair.prerequisite === secondTitle) ||
-    (pair.course === secondTitle && pair.prerequisite === firstTitle)
-  );
+  return pairs.some((pair) => {
+    const course = normalizeCourseTitle(pair.course);
+    const prerequisite = normalizeCourseTitle(pair.prerequisite);
+    return (
+      (course === firstTitle && prerequisite === secondTitle) ||
+      (course === secondTitle && prerequisite === firstTitle)
+    );
+  });
+}
+
+function isBlockConflict(first: ScheduleCourse, second: ScheduleCourse, semester: "F" | "S", rules: readonly BlockConflictRule[]) {
+  if (first.college !== "CCES" || second.college !== "CCES") return false;
+  const firstTitle = normalizeCourseTitle(first.name);
+  const secondTitle = normalizeCourseTitle(second.name);
+  return rules.some((rule) => {
+    if (rule.semester !== semester) return false;
+    const ruleTitle = normalizeCourseTitle(rule.courseTitle);
+    const blockedTitles = rule.conflictingTitles.map(normalizeCourseTitle);
+    return (
+      (ruleTitle === firstTitle && blockedTitles.includes(secondTitle)) ||
+      (ruleTitle === secondTitle && blockedTitles.includes(firstTitle))
+    );
+  });
 }
 
 function roomCapacityMap(courses: ScheduleCourse[]) {
@@ -200,6 +216,7 @@ export async function parseScheduleFile(file: File): Promise<ScheduleCourse[]> {
       available,
       status: available > 0 ? "Open" as const : "Closed" as const,
       session: String(record.SESSION_CODE || "D"),
+      semester: String(record["TERM CODE"] ?? "").trim().endsWith("20") ? "S" as const : "F" as const,
       conflicts: [] as ConflictType[],
       conflictDetails: [],
     }];
@@ -211,7 +228,16 @@ export async function parseScheduleFile(file: File): Promise<ScheduleCourse[]> {
   return courses;
 }
 
-export function recalculateConflicts(courses: ScheduleCourse[]) {
+export function recalculateConflicts(
+  courses: ScheduleCourse[],
+  semester: "F" | "S" = "F",
+  rules: {
+    blockRules?: readonly BlockConflictRule[];
+    prerequisiteRules?: readonly PrerequisitePair[];
+  } = {},
+) {
+  const activeBlockRules = rules.blockRules ?? blockConflictRules;
+  const activePrerequisiteRules = rules.prerequisiteRules ?? prerequisitePairs;
   const updated = courses.map((course) => ({
     ...course,
     name: canonicalCourseTitle(course.code, course.name),
@@ -252,12 +278,15 @@ export function recalculateConflicts(courses: ScheduleCourse[]) {
         const reasons: ConflictType[] = [];
         if (hasAssignedInstructor(first) && first.instructor === second.instructor) reasons.push("instructor");
         if (hasPhysicalRoom(first) && first.room === second.room) reasons.push("room");
-        if (isPrerequisitePair(first, second)) reasons.push("prerequisite");
+        if (isPrerequisitePair(first, second, activePrerequisiteRules)) reasons.push("prerequisite");
+        const firstSemester = first.semester ?? semester;
+        const secondSemester = second.semester ?? semester;
+        if (firstSemester === secondSemester && isBlockConflict(first, second, firstSemester, activeBlockRules)) reasons.push("block");
         reasons.forEach((reason) => {
           if (!first.conflicts.includes(reason)) first.conflicts.push(reason);
           if (!second.conflicts.includes(reason)) second.conflicts.push(reason);
-          const firstDetail = `${reason}: ${second.code} · Section ${second.section}`;
-          const secondDetail = `${reason}: ${first.code} · Section ${first.section}`;
+          const firstDetail = `${reason}: ${second.name} (${second.code}) · ${second.instructor} · Section ${second.section}`;
+          const secondDetail = `${reason}: ${first.name} (${first.code}) · ${first.instructor} · Section ${first.section}`;
           if (!first.conflictDetails?.includes(firstDetail)) first.conflictDetails?.push(firstDetail);
           if (!second.conflictDetails?.includes(secondDetail)) second.conflictDetails?.push(secondDetail);
         });

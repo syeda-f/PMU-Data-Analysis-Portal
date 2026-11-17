@@ -2,11 +2,13 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as XLSX from "xlsx";
-import GradeAnalysis from "./GradeAnalysis";
+import GradeAnalysis, { createDocxBlob } from "./GradeAnalysis";
 import { collegeProfessors } from "./collegeProfessors";
 import { CCES_MAJORS, ccesCourseCatalog, collegeCodeRules, type CcesMajor } from "./courseCatalogData";
 import { scheduleCourses } from "./scheduleData";
-import { canonicalCourseTitle, findCrossListedGroups, inferRoomCapacity, mergeCrossListedCourses, parseScheduleFile, recalculateConflicts, type Campus, type ConflictType, type ScheduleCourse } from "./scheduleImport";
+import { canonicalCourseTitle, findCrossListedGroups, inferRoomCapacity, mergeCrossListedCourses, normalizeCourseTitle, parseScheduleFile, recalculateConflicts, type Campus, type ConflictType, type ScheduleCourse } from "./scheduleImport";
+import { blockConflictRules, electiveCourseCatalog, unmergedCcesCourseCatalog, type BlockConflictRule } from "./scheduleConstraintData";
+import { prerequisitePairs, type PrerequisitePair } from "./prerequisiteData";
 import {
   initialExams,
   type Exam,
@@ -21,6 +23,21 @@ type College = "CCES" | "COBA" | "COE" | "COAD" | "CSHS" | "COL";
 type Course = ScheduleCourse;
 type ActiveView = "courses" | "grades" | "exams";
 type CourseWorkspaceView = "schedule" | "conflicts" | "add";
+type ConflictSeverity = "Critical" | "Non-critical";
+type ConflictReportPair = {
+  key: string;
+  first: Course;
+  second?: Course;
+  types: ConflictType[];
+  severity: ConflictSeverity;
+};
+type ConfigurableCourseOption = {
+  code: string;
+  title: string;
+  hours: number;
+  majors: readonly CcesMajor[];
+  isElective: boolean;
+};
 type SectionRecommendation = {
   course: Course;
   campus: Campus;
@@ -41,6 +58,42 @@ const TIMES = Array.from({ length: 16 }, (_, index) => {
   const period = hour < 12 ? "AM" : "PM";
   return `${displayHour}:00 – ${displayHour}:59 ${period}`;
 });
+
+const downloadBlob = (blob: Blob, filename: string) => {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+};
+
+const createSimplePdf = (sourceLines: string[]) => {
+  const clean = (value: string) => value.normalize("NFKD").replace(/[^\x20-\x7e]/g, "-").replace(/([\\()])/g, "\\$1");
+  const wrappedLines = sourceLines.flatMap((line) => line.match(/.{1,105}(?:\s|$)/g)?.map((part) => part.trim()) ?? [line]);
+  const pages = Array.from({ length: Math.max(1, Math.ceil(wrappedLines.length / 48)) }, (_, index) => wrappedLines.slice(index * 48, (index + 1) * 48));
+  const fontId = 3 + pages.length * 2;
+  const objects: string[] = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    `<< /Type /Pages /Kids [${pages.map((_, index) => `${3 + index * 2} 0 R`).join(" ")}] /Count ${pages.length} >>`,
+  ];
+  pages.forEach((lines, index) => {
+    const pageId = 3 + index * 2;
+    const stream = `BT /F1 8 Tf 32 810 Td 11 TL ${lines.map((line) => `(${clean(line)}) Tj T*`).join(" ")} ET`;
+    objects.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 842] /Resources << /Font << /F1 ${fontId} 0 R >> >> /Contents ${pageId + 1} 0 R >>`);
+    objects.push(`<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`);
+  });
+  objects.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+  let pdf = "%PDF-1.4\n";
+  const offsets = [0];
+  objects.forEach((object, index) => {
+    offsets.push(pdf.length);
+    pdf += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  });
+  const xref = pdf.length;
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n${offsets.slice(1).map((offset) => `${String(offset).padStart(10, "0")} 00000 n `).join("\n")}\ntrailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  return new Blob([pdf], { type: "application/pdf" });
+};
 
 const collegeNames: Record<College, string> = {
   CCES: "Computing",
@@ -400,10 +453,12 @@ function MultiSelect({
   options: string[];
   onChange: (values: string[]) => void;
 }) {
-  const { open, toggleOpen, containerRef } = useExclusiveFilterMenu();
+  const { open, setOpen, toggleOpen, containerRef } = useExclusiveFilterMenu();
   const [query, setQuery] = useState("");
   const toggleValue = (option: string) => {
     onChange(values.includes(option) ? values.filter((value) => value !== option) : [...values, option]);
+    setOpen(false);
+    setQuery("");
   };
   const filteredOptions = options.filter((option) => option.toLowerCase().includes(query.trim().toLowerCase()));
   return (
@@ -424,7 +479,7 @@ function MultiSelect({
         <div className="multi-select__menu">
           <div className="multi-select__head">
             <strong>Select time slots</strong>
-            <button onClick={() => onChange([])}>Clear</button>
+            <button onClick={() => { onChange([]); setOpen(false); }}>Clear</button>
           </div>
           <label className="filter-option-search">
             <Icon name="search" size={14} />
@@ -454,6 +509,7 @@ function SearchableMultiFilter({
   options,
   emptyLabel,
   colorSelections = false,
+  showSelectedChips = true,
   onChange,
 }: {
   label: string;
@@ -461,9 +517,10 @@ function SearchableMultiFilter({
   options: string[];
   emptyLabel: string;
   colorSelections?: boolean;
+  showSelectedChips?: boolean;
   onChange: (values: string[]) => void;
 }) {
-  const { open, toggleOpen, containerRef } = useExclusiveFilterMenu();
+  const { open, setOpen, toggleOpen, containerRef } = useExclusiveFilterMenu();
   const [query, setQuery] = useState("");
   const orderedOptions = [
     ...values.filter((value) => options.includes(value)),
@@ -474,6 +531,8 @@ function SearchableMultiFilter({
   );
   const toggleValue = (option: string) => {
     onChange(values.includes(option) ? values.filter((value) => value !== option) : [...values, option]);
+    setOpen(false);
+    setQuery("");
   };
 
   return (
@@ -491,7 +550,7 @@ function SearchableMultiFilter({
         <span>{values.length ? `${values.length} selected` : emptyLabel}</span>
         <Icon name="chevron" size={15} />
       </button>
-      {values.length > 0 && (
+      {showSelectedChips && values.length > 0 && (
         <div className="selected-filter-chips" aria-label={`Selected ${label.toLowerCase()}`}>
           {values.map((value) => (
             <span
@@ -514,7 +573,7 @@ function SearchableMultiFilter({
         <div className="multi-select__menu">
           <div className="multi-select__head">
             <strong>Select {label.toLowerCase()}</strong>
-            <button type="button" onClick={() => onChange([])}>Clear</button>
+            <button type="button" onClick={() => { onChange([]); setOpen(false); }}>Clear</button>
           </div>
           <label className="filter-option-search">
             <Icon name="search" size={14} />
@@ -651,14 +710,6 @@ function CourseCard({
   onSelect: (course: Course) => void;
 }) {
   const conflictLabel = course.conflicts.length ? ` · Conflicts: ${course.conflicts.join(", ")}` : "";
-  const [courseCode, courseNumber] = course.code.split(" ");
-  const conflictNames = {
-    room: "Room",
-    instructor: "Instructor & time",
-    course: "Course",
-    capacity: "Capacity",
-    prerequisite: "Prerequisite",
-  };
   return (
     <button
       className={`course-card ${colorByCcesPrefix ? `prefix-${getCcesColorPrefix(course).toLowerCase()}` : `college-${course.college.toLowerCase()}`} ${
@@ -668,14 +719,12 @@ function CourseCard({
       onClick={() => onSelect(course)}
     >
       <span className="course-card__line">
-        <strong>{courseCode}</strong>
-        <span>{courseNumber}</span>
-        <i>Sec {course.section}</i>
+        <strong className="course-card__title">{course.name}</strong>
+        <span className="course-card__instructor">{course.instructor}</span>
+        <i>{course.section}</i>
+        <span>{course.code}</span>
         {showConflicts && course.conflicts.length > 0 && (
           <>
-            <span className="conflict-type-label">
-              {course.conflicts.map((conflict) => conflictNames[conflict]).join(" · ")}
-            </span>
             <span className="conflict-badge" title={`Conflict: ${course.conflicts.join(", ")}`}>
               <Icon name="warningTriangle" size={14} />
             </span>
@@ -714,13 +763,18 @@ export default function App() {
   const [showFilters, setShowFilters] = useState(true);
   const [showCourseConfig, setShowCourseConfig] = useState(false);
   const [configuredCourses, setConfiguredCourses] = useState<string[]>(() =>
-    Array.from(new Set(ccesCourseCatalog.map((item) => item.code)))
+    Array.from(new Set(unmergedCcesCourseCatalog.map((item) => item.code)))
   );
   const [configCategories, setConfigCategories] = useState({ MATH: true, GEIT: true, Electives: true });
   const [conflictReportSnapshot, setConflictReportSnapshot] = useState<ScheduleCourse[] | null>(null);
-  const [includedConflictTypes, setIncludedConflictTypes] = useState<ConflictType[]>([]);
+  const [includedConflictTypes, setIncludedConflictTypes] = useState<ConflictType[]>(["block", "prerequisite"]);
   const [conflictReportColleges, setConflictReportColleges] = useState<string[]>(["CCES"]);
   const [conflictReportDepartments, setConflictReportDepartments] = useState<string[]>([]);
+  const [conflictReportGender, setConflictReportGender] = useState<"All" | Campus>("All");
+  const [conflictSeverities, setConflictSeverities] = useState<ConflictSeverity[]>(["Critical"]);
+  const [showConflictRuleConfig, setShowConflictRuleConfig] = useState(false);
+  const [editableBlockRules, setEditableBlockRules] = useState<BlockConflictRule[]>(() => blockConflictRules.map((rule) => ({ ...rule, conflictingTitles: [...rule.conflictingTitles] })));
+  const [editablePrerequisiteRules, setEditablePrerequisiteRules] = useState<PrerequisitePair[]>(() => prerequisitePairs.map((pair) => ({ ...pair })));
   const [recommendCollege, setRecommendCollege] = useState<string>("All colleges");
   const [recommendDepartmentsSelected, setRecommendDepartmentsSelected] = useState<string[]>([]);
   const [recommendCourse, setRecommendCourse] = useState<string>("Select a course");
@@ -797,7 +851,7 @@ export default function App() {
       recalculateConflicts([
         ...current.filter((course) => course.gender !== campus),
         ...matchingCampus,
-      ])
+      ], "F", { blockRules: editableBlockRules, prerequisiteRules: editablePrerequisiteRules })
     );
     uploadedHashes.add(datasetHash);
     window.localStorage.setItem(DATASET_HASHES_KEY, JSON.stringify([...uploadedHashes]));
@@ -805,24 +859,30 @@ export default function App() {
     return matchingCampus.length;
   };
 
+  const activeCcesCatalog = mergeCrossListed ? ccesCourseCatalog : unmergedCcesCourseCatalog;
+  const selectedCcesMajors = departments.filter((department): department is CcesMajor =>
+    CCES_MAJORS.includes(department as CcesMajor)
+  );
+  const selectedElectiveRows = useMemo(
+    () => electiveCourseCatalog.filter((item) => selectedCcesMajors.includes(item.department)),
+    [selectedCcesMajors]
+  );
+  const selectedElectiveCodes = useMemo(
+    () => new Set(selectedElectiveRows.map((item) => item.code)),
+    [selectedElectiveRows]
+  );
   const filteredCourses = useMemo(
     () =>
       courses.filter((course) => {
         const query = search.trim().toLowerCase();
         const { prefix, numeric } = getCourseParts(course.code);
-        const ccesRows = ccesCourseCatalog.filter((item) => item.code === course.code);
-        const selectedMajors = departments.filter((department): department is CcesMajor =>
-          CCES_MAJORS.includes(department as CcesMajor)
-        );
-        const ccesSelected = colleges.includes("CCES") || selectedMajors.length > 0;
+        const ccesRows = activeCcesCatalog.filter((item) => item.code === course.code);
+        const ccesSelected = colleges.includes("CCES") || selectedCcesMajors.length > 0;
         const isMajorCourse =
-          selectedMajors.length === 0 ||
-          ccesRows.some((item) => selectedMajors.some((major) => item.majors.includes(major)));
-        const isElective =
-          selectedMajors.length > 0 &&
-          !selectedMajors.includes(prefix as CcesMajor) &&
-          prefix !== "MATH" &&
-          prefix !== "GEIT";
+          selectedCcesMajors.length === 0 ||
+          ccesRows.some((item) => selectedCcesMajors.some((major) => item.majors.includes(major))) ||
+          selectedElectiveCodes.has(course.code);
+        const isElective = selectedElectiveCodes.has(course.code);
         const passesConfiguration =
           !ccesSelected ||
           (configuredCourses.includes(course.code) &&
@@ -831,7 +891,7 @@ export default function App() {
             (!isElective || configCategories.Electives));
         return (
           (colleges.length === 0 || colleges.some((college) => courseBelongsToCollege(course.code, college, course.name))) &&
-          (!ccesSelected || ccesRows.length > 0) &&
+          (!ccesSelected || ccesRows.length > 0 || isElective) &&
           (campusTab === "All" || course.gender === campusTab) &&
           types.includes(course.roomType) &&
           (departments.length === 0 || (ccesSelected ? isMajorCourse : departments.includes(prefix))) &&
@@ -852,7 +912,7 @@ export default function App() {
           (!query || `${course.id} ${course.code} ${course.code.split(" ")[0]} ${course.name} ${course.instructor} ${course.room}`.toLowerCase().includes(query))
         );
       }),
-    [campusTab, colleges, configuredCourses, configCategories, courseNames, departments, instructors, levels, numericCodes, prefixes, rooms, search, statuses, timeSlots, types, courses]
+    [activeCcesCatalog, campusTab, colleges, configuredCourses, configCategories, courseNames, departments, instructors, levels, numericCodes, prefixes, rooms, search, selectedCcesMajors, selectedElectiveCodes, statuses, timeSlots, types, courses]
   );
   const conflictReportDepartmentOptions = useMemo(() => {
     if (conflictReportColleges.length === 0) {
@@ -871,78 +931,132 @@ export default function App() {
     const prefix = getCourseParts(course.code).prefix;
     return (
       (conflictReportColleges.length === 0 || conflictReportColleges.some((college) => courseBelongsToCollege(course.code, college, course.name))) &&
-      (conflictReportDepartments.length === 0 || conflictReportDepartments.includes(prefix))
+      (conflictReportDepartments.length === 0 || conflictReportDepartments.includes(prefix)) &&
+      (conflictReportGender === "All" || course.gender === conflictReportGender)
     );
-  }), [conflictReportColleges, conflictReportDepartments, courses]);
+  }), [conflictReportColleges, conflictReportDepartments, conflictReportGender, courses]);
   const reportScope = conflictReportSnapshot ?? [];
-  const crossListedGroups = useMemo(() => findCrossListedGroups(reportScope), [reportScope]);
-  const conflictReportRows = useMemo(() => [...reportScope]
-    .filter((course) => course.conflicts.some((type) => includedConflictTypes.includes(type)))
-    .sort((a, b) => {
-      const priority = (course: Course) =>
-        course.conflicts.includes("course") ? 0 :
-        course.conflicts.includes("instructor") ? 1 :
-        course.conflicts.includes("room") ? 2 :
-        course.conflicts.includes("capacity") ? 3 : 4;
-      return priority(a) - priority(b) || a.code.localeCompare(b.code) || a.section.localeCompare(b.section);
-    }), [includedConflictTypes, reportScope]);
+  const crossListedGroups = useMemo(() => findCrossListedGroups(conflictReportSource), [conflictReportSource]);
+  const conflictReportRows = useMemo<ConflictReportPair[]>(() => {
+    const courseIdentity = (course: Course) => [
+      course.gender,
+      normalizeCourseTitle(course.name),
+      course.section,
+      course.instructor,
+      [...course.days].sort().join(","),
+      course.startMinute,
+      course.endMinute,
+    ].join("|");
+    const sectionCount = (course: Course) => reportScope.filter((item) =>
+      item.gender === course.gender && normalizeCourseTitle(item.name) === normalizeCourseTitle(course.name)
+    ).length;
+    const pairs = new Map<string, { first: Course; second?: Course; types: Set<ConflictType> }>();
+
+    reportScope.forEach((course) => {
+      const handledTypes = new Set<ConflictType>();
+      (course.conflictDetails ?? []).forEach((detail) => {
+        const match = detail.match(/^([a-z]+):\s*(.*?)\s+\((.*?)\)\s+·\s+(.*?)\s+·\s+Section\s+(.+)$/i);
+        if (!match) return;
+        const type = match[1] as ConflictType;
+        if (!includedConflictTypes.includes(type)) return;
+        handledTypes.add(type);
+        const [, , title, , instructor, section] = match;
+        const second = reportScope.find((candidate) =>
+          candidate !== course &&
+          candidate.gender === course.gender &&
+          candidate.section === section.trim() &&
+          candidate.instructor === instructor.trim() &&
+          normalizeCourseTitle(candidate.name) === normalizeCourseTitle(title)
+        );
+        if (!second) return;
+        const identities = [courseIdentity(course), courseIdentity(second)].sort();
+        const key = identities.join("::");
+        const existing = pairs.get(key);
+        if (existing) existing.types.add(type);
+        else {
+          const firstIsCourse = courseIdentity(course) === identities[0];
+          pairs.set(key, {
+            first: firstIsCourse ? course : second,
+            second: firstIsCourse ? second : course,
+            types: new Set([type]),
+          });
+        }
+      });
+
+      includedConflictTypes.forEach((type) => {
+        if (!course.conflicts.includes(type) || handledTypes.has(type)) return;
+        const key = `single::${courseIdentity(course)}`;
+        const existing = pairs.get(key);
+        if (existing) existing.types.add(type);
+        else pairs.set(key, { first: course, types: new Set([type]) });
+      });
+    });
+
+    const priority = (types: ConflictType[]) => {
+      const order: ConflictType[] = ["course", "block", "prerequisite", "instructor", "room", "capacity"];
+      return Math.min(...types.map((type) => order.indexOf(type)));
+    };
+    return [...pairs.entries()].map(([key, pair]) => {
+      const severity: ConflictSeverity = pair.second && sectionCount(pair.first) === 1 && sectionCount(pair.second) === 1
+        ? "Critical"
+        : "Non-critical";
+      return { key, first: pair.first, second: pair.second, types: [...pair.types], severity };
+    })
+      .filter((pair) => conflictSeverities.length === 0 || conflictSeverities.includes(pair.severity))
+      .sort((a, b) => priority(a.types) - priority(b.types) || a.first.code.localeCompare(b.first.code) || a.first.section.localeCompare(b.first.section));
+  }, [conflictSeverities, includedConflictTypes, reportScope]);
   const conflictCounts = useMemo(() => ({
-    course: includedConflictTypes.includes("course") ? reportScope.filter((course) => course.conflicts.includes("course")).length : 0,
-    instructor: includedConflictTypes.includes("instructor") ? reportScope.filter((course) => course.conflicts.includes("instructor")).length : 0,
-    room: includedConflictTypes.includes("room") ? reportScope.filter((course) => course.conflicts.includes("room")).length : 0,
-    capacity: includedConflictTypes.includes("capacity") ? reportScope.filter((course) => course.conflicts.includes("capacity")).length : 0,
-    prerequisite: includedConflictTypes.includes("prerequisite") ? reportScope.filter((course) => course.conflicts.includes("prerequisite")).length : 0,
-  }), [includedConflictTypes, reportScope]);
+    course: conflictReportRows.filter((pair) => pair.types.includes("course")).length,
+    instructor: conflictReportRows.filter((pair) => pair.types.includes("instructor")).length,
+    room: conflictReportRows.filter((pair) => pair.types.includes("room")).length,
+    capacity: conflictReportRows.filter((pair) => pair.types.includes("capacity")).length,
+    prerequisite: conflictReportRows.filter((pair) => pair.types.includes("prerequisite")).length,
+    block: conflictReportRows.filter((pair) => pair.types.includes("block")).length,
+  }), [conflictReportRows]);
   const displayedCourses = useMemo(
     () => mergeCrossListed ? mergeCrossListedCourses(filteredCourses) : filteredCourses,
     [filteredCourses, mergeCrossListed]
   );
-  const downloadConflictReport = () => {
+  const downloadConflictReport = (format: "csv" | "xlsx" | "docx" | "pdf") => {
     if (!conflictReportSnapshot) return;
-    const escape = (value: string | number) => `"${String(value).replace(/"/g, "\"\"")}"`;
-    const rows = [
-      ["Report Scope", `${conflictReportColleges.length ? conflictReportColleges.join(" / ") : "All colleges"}; ${conflictReportDepartments.length ? conflictReportDepartments.join(" / ") : "All departments"}`],
+    const rows: Array<Array<string | number>> = [
+      ["Report Scope", `${conflictReportColleges.length ? conflictReportColleges.join(" / ") : "All colleges"}; ${conflictReportDepartments.length ? conflictReportDepartments.join(" / ") : "All departments"}; ${conflictReportGender === "All" ? "All genders" : conflictReportGender}; ${conflictSeverities.length ? conflictSeverities.join(" / ") : "All severities"}`],
       [],
-      ["Status", "Priority", "Campus", "Course", "Section", "CRN", "Instructor", "Room", "Room Capacity", "Enrollment", "Days", "Time", "Conflict Types", "Conflicts With / Detail"],
-      ...conflictReportRows.map((course) => [
+      ["Status", "Severity", "Conflict Types", "Gender", "Course A", "Course A Title", "Section A", "Instructor A", "Course B", "Course B Title", "Section B", "Instructor B", "Days", "Time"],
+      ...conflictReportRows.map((pair) => [
         "Unresolved",
-        course.conflicts.includes("course") ? "1 - Course" : course.conflicts.includes("instructor") ? "2 - Instructor" : course.conflicts.includes("room") ? "3 - Room" : course.conflicts.includes("capacity") ? "4 - Capacity" : "5 - Prerequisite",
-        course.gender,
-        course.code,
-        course.section,
-        course.id,
-        course.instructor,
-        course.room,
-        inferRoomCapacity(reportScope, course),
-        course.enrolled,
-        course.days.join(" / "),
-        `${formatMinutes(course.startMinute)} - ${formatMinutes(course.endMinute)}`,
-        course.conflicts.filter((type) => includedConflictTypes.includes(type)).join(" / "),
-        (course.conflictDetails ?? []).filter((detail) => includedConflictTypes.some((type) => detail.startsWith(`${type}:`))).join(" / "),
+        pair.severity,
+        pair.types.join(" / "),
+        pair.first.gender,
+        pair.first.code,
+        pair.first.name,
+        pair.first.section,
+        pair.first.instructor,
+        pair.second?.code ?? "",
+        pair.second?.name ?? "",
+        pair.second?.section ?? "",
+        pair.second?.instructor ?? "",
+        pair.first.days.join(" / "),
+        `${formatMinutes(pair.first.startMinute)} - ${formatMinutes(pair.first.endMinute)}`,
       ]),
-      ...crossListedGroups.flatMap((group) => group.courses.map((course) => [
-        "Resolved cross-list",
-        "Cross-listed",
-        course.gender,
-        course.code,
-        course.section,
-        course.id,
-        course.instructor,
-        course.room,
-        inferRoomCapacity(reportScope, course),
-        course.enrolled,
-        course.days.join(" / "),
-        `${formatMinutes(course.startMinute)} - ${formatMinutes(course.endMinute)}`,
-        `Linked with ${group.courses.filter((item) => item !== course).map((item) => `${item.code}-${item.section}`).join(" / ")}`,
-      ])),
     ];
-    const blob = new Blob([rows.map((row) => row.map(escape).join(",")).join("\n")], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "Fall_2027_Complete_Course_Conflict_Report.csv";
-    link.click();
-    URL.revokeObjectURL(url);
+    const filename = "Fall_2027_Complete_Course_Conflict_Report";
+    if (format === "xlsx") {
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(rows), "Conflict Report");
+      XLSX.writeFileXLSX(workbook, `${filename}.xlsx`);
+      return;
+    }
+    if (format === "pdf") {
+      downloadBlob(createSimplePdf(rows.map((row) => row.join(" | "))), `${filename}.pdf`);
+      return;
+    }
+    if (format === "docx") {
+      downloadBlob(createDocxBlob(rows.map((row) => row.join(" | "))), `${filename}.docx`);
+      return;
+    }
+    const escapeCsv = (value: string | number) => `"${String(value).replace(/"/g, "\"\"")}"`;
+    downloadBlob(new Blob([rows.map((row) => row.map(escapeCsv).join(",")).join("\n")], { type: "text/csv;charset=utf-8" }), `${filename}.csv`);
   };
   const exportCampusSchedule = (campus: Campus) => {
     const rows = courses.filter((course) => course.gender === campus).map((course) => ({
@@ -1029,9 +1143,9 @@ export default function App() {
         (course) =>
           (campusTab === "All" || course.gender === campusTab) &&
           (colleges.length === 0 || colleges.some((college) => courseBelongsToCollege(course.code, college, course.name))) &&
-          (!colleges.includes("CCES") || ccesCourseCatalog.some((item) => item.code === course.code))
+          (!colleges.includes("CCES") || activeCcesCatalog.some((item) => item.code === course.code) || selectedElectiveCodes.has(course.code))
       ),
-    [campusTab, colleges, courses]
+    [activeCcesCatalog, campusTab, colleges, courses, selectedElectiveCodes]
   );
   const courseDepartments = useMemo(
     () => colleges.includes("CCES")
@@ -1057,24 +1171,36 @@ export default function App() {
       ? canonicalCourseTitle(course.code, course.name)
       : course.name)
   )).sort(), [colleges, courseOptionPool]);
-  const selectedCcesMajors = departments.filter((department): department is CcesMajor =>
-    CCES_MAJORS.includes(department as CcesMajor)
-  );
   const configEnabled = colleges.includes("CCES") || selectedCcesMajors.length > 0;
   const configurableCourseRows = useMemo(
-    () => ccesCourseCatalog.filter(
+    () => activeCcesCatalog.filter(
       (item) =>
         selectedCcesMajors.length === 0 ||
         selectedCcesMajors.some((major) => item.majors.includes(major))
     ),
-    [selectedCcesMajors]
+    [activeCcesCatalog, selectedCcesMajors]
   );
   const configurableCourseOptions = useMemo(
-    () => Array.from(
-      new Map(configurableCourseRows.map((item) => [item.code, item])).values()
-    ).sort((a, b) => a.code.localeCompare(b.code, undefined, { numeric: true })),
-    [configurableCourseRows]
+    () => {
+      const options: ConfigurableCourseOption[] = [
+        ...configurableCourseRows
+          .filter((item) => !selectedElectiveCodes.has(item.code))
+          .map((item) => ({ ...item, isElective: false })),
+        ...selectedElectiveRows.map((item) => ({
+          code: item.code,
+          title: item.title,
+          hours: 0,
+          majors: [item.department] as readonly CcesMajor[],
+          isElective: true,
+        })),
+      ];
+      return Array.from(new Map(options.map((item) => [item.code, item])).values())
+        .sort((a, b) => a.code.localeCompare(b.code, undefined, { numeric: true }));
+    },
+    [configurableCourseRows, selectedElectiveCodes, selectedElectiveRows]
   );
+  const configurableCoreOptions = configurableCourseOptions.filter((item) => !item.isElective);
+  const configurableElectiveOptions = configurableCourseOptions.filter((item) => item.isElective);
   const courseInstructors = useMemo<string[]>(() => {
     const selectedColleges = colleges.length ? colleges : Object.keys(collegeProfessors);
     return Array.from(new Set(selectedColleges.flatMap((college) =>
@@ -1221,7 +1347,7 @@ export default function App() {
       status: "Open",
       conflicts: [],
     };
-    setCourses((current) => recalculateConflicts([...current, newCourse]));
+    setCourses((current) => recalculateConflicts([...current, newCourse], "F", { blockRules: editableBlockRules, prerequisiteRules: editablePrerequisiteRules }));
     setUserAddedSections((count) => count + 1);
     setCourseWorkspaceView("schedule");
   };
@@ -1464,7 +1590,7 @@ export default function App() {
                         setCourseNames([]);
                         setPrefixes([]);
                         setNumericCodes([]);
-                        setConfiguredCourses(Array.from(new Set(ccesCourseCatalog.map((item) => item.code))));
+                        setConfiguredCourses(Array.from(new Set(activeCcesCatalog.map((item) => item.code))));
                         setConfigCategories({ MATH: true, GEIT: true, Electives: true });
                       }}
                     />
@@ -1475,7 +1601,15 @@ export default function App() {
                       emptyLabel="All departments"
                       onChange={(values) => {
                         setDepartments(values);
-                        setConfiguredCourses(Array.from(new Set(ccesCourseCatalog.map((item) => item.code))));
+                        const selectedMajorValues = values.filter((value): value is CcesMajor => CCES_MAJORS.includes(value as CcesMajor));
+                        setConfiguredCourses(Array.from(new Set([
+                          ...activeCcesCatalog
+                            .filter((item) => selectedMajorValues.length === 0 || selectedMajorValues.some((major) => item.majors.includes(major)))
+                            .map((item) => item.code),
+                          ...electiveCourseCatalog
+                            .filter((item) => selectedMajorValues.includes(item.department))
+                            .map((item) => item.code),
+                        ])));
                         setConfigCategories({ MATH: true, GEIT: true, Electives: true });
                       }}
                     />
@@ -1598,7 +1732,14 @@ export default function App() {
 
                   <div className="schedule-meta">
                 <div className="legend">
-                  {colleges.length === 1 && colleges[0] === "CCES"
+                  {instructors.length > 1
+                    ? instructors.map((instructor, index) => (
+                      <span key={instructor}>
+                        <i className={`legend-dot instructor-color-dot instructor-track-${index % 12}`}></i>
+                        {instructor}
+                      </span>
+                    ))
+                    : colleges.length === 1 && colleges[0] === "CCES"
                     ? CCES_PREFIX_LEGEND.map((item) => (
                       <span key={item.prefix}>
                         <i className={`legend-dot prefix-${item.prefix.toLowerCase()}`}></i>
@@ -1625,7 +1766,18 @@ export default function App() {
                   <b>{filteredCourses.filter((course) => course.conflicts.length > 0).length}</b>
                 </label>
                 <label className="conflict-toggle">
-                  <input type="checkbox" checked={mergeCrossListed} onChange={(event) => setMergeCrossListed(event.target.checked)} />
+                  <input type="checkbox" checked={mergeCrossListed} onChange={(event) => {
+                    const checked = event.target.checked;
+                    const nextCatalog = checked ? ccesCourseCatalog : unmergedCcesCourseCatalog;
+                    setMergeCrossListed(checked);
+                    setConfiguredCourses(Array.from(new Set([
+                      ...nextCatalog
+                        .filter((item) => selectedCcesMajors.length === 0 || selectedCcesMajors.some((major) => item.majors.includes(major)))
+                        .map((item) => item.code),
+                      ...selectedElectiveRows.map((item) => item.code),
+                    ])));
+                    setConfigCategories({ MATH: true, GEIT: true, Electives: true });
+                  }} />
                   <span className="toggle-track"><i></i></span>
                   Merge cross-listed
                   <b>{findCrossListedGroups(filteredCourses).length}</b>
@@ -1667,7 +1819,7 @@ export default function App() {
                                 showConflicts={showConflicts}
                                 colorByCcesPrefix={colleges.length === 1 && colleges[0] === "CCES"}
                                 instructorTrack={
-                                  !(colleges.length === 1 && colleges[0] === "CCES") && instructors.includes(course.instructor)
+                                  instructors.length > 1 && instructors.includes(course.instructor)
                                     ? instructors.indexOf(course.instructor)
                                     : undefined
                                 }
@@ -2338,8 +2490,8 @@ export default function App() {
                 <h2>Configure courses</h2>
                 <p>
                   {selectedCcesMajors.length
-                    ? `${selectedCcesMajors.join(", ")} curriculum courses from the CCES dataset`
-                    : "All courses from the CCES dataset"}
+                    ? `${selectedCcesMajors.join(", ")} curriculum courses from the ${mergeCrossListed ? "merged CCES_Course" : "unmerged_CCES_Courses"} dataset`
+                    : `All courses from the ${mergeCrossListed ? "merged CCES_Course" : "unmerged_CCES_Courses"} dataset`}
                 </p>
               </div>
               <button className="close-button" onClick={() => setShowCourseConfig(false)} aria-label="Close">
@@ -2363,8 +2515,30 @@ export default function App() {
               </span>
             </label>
             <div className="course-config-list">
-              {configurableCourseOptions.map((item) => (
+              {configurableCoreOptions.map((item) => (
                 <label key={item.code}>
+                  <input
+                    type="checkbox"
+                    checked={configuredCourses.includes(item.code)}
+                    onChange={() =>
+                      setConfiguredCourses((current) =>
+                        current.includes(item.code)
+                          ? current.filter((code) => code !== item.code)
+                          : [...current, item.code]
+                      )
+                    }
+                  />
+                  <span><strong>{item.code}</strong><small>{item.title}</small></span>
+                </label>
+              ))}
+              {selectedCcesMajors.length > 0 && (
+                <div className="course-config-list__group">
+                  <strong>{selectedCcesMajors.join(" / ")} electives</strong>
+                  <small>From Electives.xlsx; semester values are intentionally ignored.</small>
+                </div>
+              )}
+              {configurableElectiveOptions.map((item) => (
+                <label className="course-config-elective" key={`elective-${item.code}`}>
                   <input
                     type="checkbox"
                     checked={configuredCourses.includes(item.code)}
@@ -2396,17 +2570,15 @@ export default function App() {
                           setConfiguredCourses((current) => current.filter((code) => !code.startsWith(`${category} `)));
                         }
                         if (!checked && category === "Electives") {
-                          setConfiguredCourses((current) => current.filter((code) => {
-                            const prefix = getCourseParts(code).prefix;
-                            return prefix === "MATH" || prefix === "GEIT" || selectedCcesMajors.includes(prefix as CcesMajor);
-                          }));
+                          const electiveCodes = new Set(configurableElectiveOptions.map((item) => item.code));
+                          setConfiguredCourses((current) => current.filter((code) => !electiveCodes.has(code)));
                         }
                         if (checked) {
                           const categoryCodes = configurableCourseOptions
                             .filter((item) => {
                               const prefix = getCourseParts(item.code).prefix;
                               if (category === "MATH" || category === "GEIT") return prefix === category;
-                              return prefix !== "MATH" && prefix !== "GEIT" && !selectedCcesMajors.includes(prefix as CcesMajor);
+                              return item.isElective;
                             })
                             .map((item) => item.code);
                           setConfiguredCourses((current) => [...new Set([...current, ...categoryCodes])]);
@@ -2417,9 +2589,73 @@ export default function App() {
                   </label>
                 ))}
               </div>
-              <small>Electives are determined by the selected major columns in CCES_Courses.</small>
+              <small>Electives are determined by the department rows in Electives.xlsx for the selected major.</small>
             </div>
             <Button className="drawer-action" onClick={() => setShowCourseConfig(false)}>Apply configuration</Button>
+          </aside>
+        </div>
+      )}
+
+      {showConflictRuleConfig && activeTab === "courses" && courseWorkspaceView === "conflicts" && (
+        <div className="drawer-backdrop" onMouseDown={() => setShowConflictRuleConfig(false)}>
+          <aside className="conflict-rule-drawer" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="drawer-head">
+              <div>
+                <span className="eyebrow"><Icon name="calendar" size={14} /> Conflict rules</span>
+                <h2>Configure conflict datasets</h2>
+                <p>Edit the active Block Conflict and Prerequisite Conflict rules for this schedule.</p>
+              </div>
+              <button className="close-button" onClick={() => setShowConflictRuleConfig(false)} aria-label="Close">
+                <Icon name="close" />
+              </button>
+            </div>
+            <section className="conflict-rule-section">
+              <div className="conflict-rule-section__head">
+                <div><strong>Block conflicts</strong><span>{editableBlockRules.length} rules</span></div>
+                <button type="button" onClick={() => setEditableBlockRules((current) => [...current, { courseCode: "", courseTitle: "", conflictingTitles: [], semester: "F" }])}>Add rule</button>
+              </div>
+              <div className="conflict-rule-list">
+                {editableBlockRules.map((rule, index) => (
+                  <article key={`block-rule-${index}`}>
+                    <div className="conflict-rule-grid">
+                      <label>Course code<input value={rule.courseCode} onChange={(event) => setEditableBlockRules((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, courseCode: event.target.value } : item))} /></label>
+                      <label>Course title<input value={rule.courseTitle} onChange={(event) => setEditableBlockRules((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, courseTitle: event.target.value } : item))} /></label>
+                      <label>Semester<select value={rule.semester} onChange={(event) => setEditableBlockRules((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, semester: event.target.value as "F" | "S" } : item))}><option value="F">Fall</option><option value="S">Spring</option></select></label>
+                      <label className="conflict-rule-wide">Must not overlap with<textarea rows={2} value={rule.conflictingTitles.join(", ")} onChange={(event) => setEditableBlockRules((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, conflictingTitles: event.target.value.split(",").map((value) => value.trim()).filter(Boolean) } : item))} /></label>
+                    </div>
+                    <button type="button" className="conflict-rule-delete" onClick={() => setEditableBlockRules((current) => current.filter((_, itemIndex) => itemIndex !== index))}>Remove</button>
+                  </article>
+                ))}
+              </div>
+            </section>
+            <section className="conflict-rule-section">
+              <div className="conflict-rule-section__head">
+                <div><strong>Prerequisite conflicts</strong><span>{editablePrerequisiteRules.length} rules</span></div>
+                <button type="button" onClick={() => setEditablePrerequisiteRules((current) => [...current, { course: "", prerequisite: "" }])}>Add rule</button>
+              </div>
+              <div className="conflict-rule-list conflict-rule-list--prerequisites">
+                {editablePrerequisiteRules.map((rule, index) => (
+                  <article key={`prerequisite-rule-${index}`}>
+                    <div className="conflict-rule-grid">
+                      <label>Course<input value={rule.course} onChange={(event) => setEditablePrerequisiteRules((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, course: event.target.value } : item))} /></label>
+                      <label>Prerequisite<input value={rule.prerequisite} onChange={(event) => setEditablePrerequisiteRules((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, prerequisite: event.target.value } : item))} /></label>
+                    </div>
+                    <button type="button" className="conflict-rule-delete" onClick={() => setEditablePrerequisiteRules((current) => current.filter((_, itemIndex) => itemIndex !== index))}>Remove</button>
+                  </article>
+                ))}
+              </div>
+            </section>
+            <div className="conflict-rule-actions">
+              <Button variant="secondary" onClick={() => {
+                setEditableBlockRules(blockConflictRules.map((rule) => ({ ...rule, conflictingTitles: [...rule.conflictingTitles] })));
+                setEditablePrerequisiteRules(prerequisitePairs.map((pair) => ({ ...pair })));
+              }}>Restore workbook defaults</Button>
+              <Button onClick={() => {
+                setCourses((current) => recalculateConflicts(current, "F", { blockRules: editableBlockRules, prerequisiteRules: editablePrerequisiteRules }));
+                setConflictReportSnapshot(null);
+                setShowConflictRuleConfig(false);
+              }}>Apply rules</Button>
+            </div>
           </aside>
         </div>
       )}
@@ -2444,12 +2680,13 @@ export default function App() {
                 <strong>Report scope</strong>
                 <span>{conflictReportSource.length} matching Course Schedule sections.</span>
               </div>
-              <div className="conflict-report-filters">
+              <div className="conflict-report-filter-line">
                 <SearchableMultiFilter
                   label="College"
                   values={conflictReportColleges}
                   options={Object.keys(collegeNames)}
                   emptyLabel="All colleges"
+                  showSelectedChips={false}
                   onChange={(values) => {
                     setConflictReportColleges(values);
                     setConflictReportDepartments([]);
@@ -2461,60 +2698,113 @@ export default function App() {
                   values={conflictReportDepartments}
                   options={conflictReportDepartmentOptions}
                   emptyLabel="All departments"
+                  showSelectedChips={false}
                   onChange={(values) => {
                     setConflictReportDepartments(values);
                     setConflictReportSnapshot(null);
                   }}
                 />
+                <div className="conflict-gender-tabs">
+                  <span>Gender</span>
+                  <div role="tablist" aria-label="Conflict report gender">
+                    {(["Female", "Male", "All"] as const).map((gender) => <button type="button" role="tab" aria-selected={conflictReportGender === gender} className={conflictReportGender === gender ? "active" : ""} onClick={() => {
+                      setConflictReportGender(gender);
+                      setConflictReportSnapshot(null);
+                    }} key={gender}>{gender}</button>)}
+                  </div>
+                </div>
+                <div className="conflict-severity-tabs">
+                  <span>Severity</span>
+                  <div role="tablist" aria-label="Conflict severity">
+                    {(["Critical", "Non-critical"] as const).map((severity) => <button type="button" role="tab" aria-selected={conflictSeverities.includes(severity)} className={conflictSeverities.includes(severity) ? "active" : ""} onClick={() => {
+                      setConflictSeverities([severity]);
+                      setConflictReportSnapshot(null);
+                    }} key={severity}>{severity}</button>)}
+                  </div>
+                </div>
+                <fieldset className="conflict-type-filters">
+                  <legend>Conflict types</legend>
+                  {(["course", "block", "instructor", "room", "capacity", "prerequisite"] as ConflictType[]).map((type) => (
+                    <label key={type}>
+                      <input
+                        type="checkbox"
+                        checked={includedConflictTypes.includes(type)}
+                        onChange={() => setIncludedConflictTypes((current) =>
+                          current.includes(type) ? current.filter((item) => item !== type) : [...current, type]
+                        )}
+                      />
+                      <span>{type}</span>
+                    </label>
+                  ))}
+                </fieldset>
+              </div>
+              <div className="conflict-report-actions">
+                <button type="button" className="conflict-filter-reset" onClick={() => {
+                  setConflictReportColleges(["CCES"]);
+                  setConflictReportDepartments([]);
+                  setConflictReportGender("All");
+                  setConflictSeverities(["Critical"]);
+                  setIncludedConflictTypes(["block", "prerequisite"]);
+                  setConflictReportSnapshot(null);
+                }}>Reset</button>
+                <Button variant="secondary" onClick={() => setShowConflictRuleConfig(true)}><Icon name="calendar" size={15} /> Configure</Button>
+                <Button onClick={() => setConflictReportSnapshot(mergeCrossListedCourses(conflictReportSource))}><Icon name="chart" size={15} /> Generate</Button>
               </div>
               <div className="conflict-report-all-scope"><Icon name="calendar" size={16} /><span>All campuses, levels, statuses, instructors, rooms, time slots, and section types within this college and department scope.</span></div>
-              <fieldset className="conflict-type-filters">
-                <legend><span>Include conflict types</span><button type="button" onClick={() => setIncludedConflictTypes([])}>Reset</button></legend>
-                {(["course", "instructor", "room", "capacity", "prerequisite"] as ConflictType[]).map((type) => (
-                  <label key={type}>
-                    <input
-                      type="checkbox"
-                      checked={includedConflictTypes.includes(type)}
-                      onChange={() => setIncludedConflictTypes((current) =>
-                        current.includes(type) ? current.filter((item) => item !== type) : [...current, type]
-                      )}
-                    />
-                    <span>{type}</span>
-                  </label>
-                ))}
-              </fieldset>
-              <Button onClick={() => setConflictReportSnapshot([...conflictReportSource])}><Icon name="chart" size={15} /> Generate Filtered Report</Button>
             </section>
 
             {conflictReportSnapshot && <>
             <div className="cross-list-status">
               <Icon name="userCheck" size={18} />
-              <span><strong>Cross-listed sections normalized</strong>{crossListedGroups.length} linked meeting groups ({crossListedGroups.reduce((sum, group) => sum + group.courses.length, 0)} section records) are excluded from false room and instructor conflicts.</span>
+              <span><strong>Cross-listed sections merged</strong>{crossListedGroups.length} linked meeting groups ({crossListedGroups.reduce((sum, group) => sum + group.courses.length, 0)} source section records) were merged using the CCES Courses mapping.</span>
             </div>
 
             <div className="conflict-report-summary">
               <article><span>1 · Course</span><strong>{conflictCounts.course}</strong><small>Resolve first</small></article>
-              <article><span>2 · Instructor</span><strong>{conflictCounts.instructor}</strong><small>Resolve second</small></article>
-              <article><span>3 · Room</span><strong>{conflictCounts.room}</strong><small>Room overlaps</small></article>
-              <article><span>4 · Capacity</span><strong>{conflictCounts.capacity}</strong><small>Enrollment issues</small></article>
-              <article><span>5 · Prerequisite</span><strong>{conflictCounts.prerequisite}</strong><small>CCES course pairs</small></article>
+              <article><span>2 · Block</span><strong>{conflictCounts.block}</strong><small>Semester rules</small></article>
+              <article><span>3 · Instructor</span><strong>{conflictCounts.instructor}</strong><small>Resolve third</small></article>
+              <article><span>4 · Room</span><strong>{conflictCounts.room}</strong><small>Room overlaps</small></article>
+              <article><span>5 · Capacity</span><strong>{conflictCounts.capacity}</strong><small>Enrollment issues</small></article>
+              <article><span>6 · Prerequisite</span><strong>{conflictCounts.prerequisite}</strong><small>CCES course pairs</small></article>
             </div>
 
             <div className="conflict-report-heading">
-              <div><strong>Unresolved conflicts</strong><span>Prioritized by course, instructor, room, capacity, and CCES prerequisites.</span></div>
-              <b>{conflictReportRows.length} sections</b>
+              <div><strong>Unresolved conflicts</strong><span>Prioritized by course, block, instructor, room, capacity, and CCES prerequisites.</span></div>
+              <b>{conflictReportRows.length} conflicts</b>
             </div>
             <div className="conflict-report-list">
-              {conflictReportRows.map((course, index) => (
-                <article key={`${course.id}-${course.code}-${course.section}-${index}`}>
-                  <span className={`conflict-priority conflict-priority--${course.conflicts.includes("course") ? "course" : course.conflicts.includes("instructor") ? "instructor" : "other"}`}>{course.conflicts.includes("course") ? "Course" : course.conflicts.includes("instructor") ? "Instructor" : course.conflicts[0]}</span>
-                  <div><strong>{course.code} · Section {course.section}</strong><span>{course.gender} · {course.days.join(", ")} · {formatMinutes(course.startMinute)}–{formatMinutes(course.endMinute)}</span><small>{course.instructor} · {course.room}{course.conflicts.includes("capacity") ? ` · ${course.enrolled}/${inferRoomCapacity(reportScope, course)} seats` : ""}</small><small>{(course.conflictDetails ?? []).filter((detail) => includedConflictTypes.some((type) => detail.startsWith(`${type}:`))).join(" · ")}</small></div>
-                  <b>{course.conflicts.filter((type) => includedConflictTypes.includes(type)).join(" · ")}</b>
+              {conflictReportRows.map((pair) => (
+                <article key={pair.key}>
+                  <div className="conflict-pair-types">
+                    {pair.types.map((type) => <span className={`conflict-priority conflict-priority--${type}`} key={type}>{type}</span>)}
+                    <small>{pair.severity}</small>
+                  </div>
+                  <div className="conflict-course-pair">
+                    {[pair.first, pair.second].map((course, index) => course ? (
+                      <section className="conflict-course-box" key={`${course.id}-${course.code}-${course.section}-${index}`}>
+                        <strong>{course.name}</strong>
+                        <b>{course.code} · Section {course.section}</b>
+                        <span>{course.instructor}</span>
+                        <small>{course.gender} · {course.days.join(", ")} · {formatMinutes(course.startMinute)}–{formatMinutes(course.endMinute)}</small>
+                        <small>{course.room}{course.conflicts.includes("capacity") ? ` · ${course.enrolled}/${inferRoomCapacity(reportScope, course)} seats` : ""}</small>
+                      </section>
+                    ) : (
+                      <section className="conflict-course-box conflict-course-box--empty" key="unpaired">
+                        <strong>No paired course</strong>
+                        <span>This conflict applies to one scheduled section.</span>
+                      </section>
+                    ))}
+                  </div>
                 </article>
               ))}
               {!conflictReportRows.length && <div className="conflict-report-empty"><Icon name="userCheck" /><strong>No unresolved conflicts</strong><span>The current schedule passes all conflict checks.</span></div>}
             </div>
-            <Button className="drawer-action" onClick={downloadConflictReport}><Icon name="fileText" /> Download CSV report</Button>
+            <div className="conflict-report-downloads">
+              <Button variant="secondary" onClick={() => downloadConflictReport("csv")}><Icon name="fileText" /> CSV</Button>
+              <Button variant="secondary" onClick={() => downloadConflictReport("xlsx")}><Icon name="fileText" /> Excel</Button>
+              <Button variant="secondary" onClick={() => downloadConflictReport("docx")}><Icon name="fileText" /> Word</Button>
+              <Button onClick={() => downloadConflictReport("pdf")}><Icon name="fileText" /> PDF</Button>
+            </div>
             </>}
           </aside>
         </div>
