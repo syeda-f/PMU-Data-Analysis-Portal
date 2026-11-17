@@ -4,6 +4,7 @@ import { type Grade, type GradeRecord } from "./gradeData";
 import { sectionGradeData, type SectionGradeRecord } from "./sectionGradeData";
 import { collegeProfessors, findProfessorEmail } from "./collegeProfessors";
 import { canonicalCourseTitle } from "./scheduleImport";
+import { openOutlookDraft } from "@/lib/outlook-draft";
 
 type DisplayMode = "Student Count" | "Percentage";
 type ReportMode = "course" | "section";
@@ -857,7 +858,7 @@ export default function GradeAnalysis({ mergeEnabled, onMergeChange }: { mergeEn
       to: recipients,
       missingRecipients,
       subject: `${course} Grade Distribution Review`,
-      body: `Sender: ${senderEmail}\n\nReport flag: ${[highFlag ? "High average performance" : "", lowFlag ? "Low average performance" : ""].filter(Boolean).join(" and ")}\n\nCourse: ${course} — ${courseSections[0]?.title ?? ""}\nInstructors: ${instructors.join(", ")}\n\nGrade breakdown by section and instructor:\n${details}`,
+      body: `Report flag: ${[highFlag ? "High average performance" : "", lowFlag ? "Low average performance" : ""].filter(Boolean).join(" and ")}\n\nCourse: ${course} — ${courseSections[0]?.title ?? ""}\nInstructors: ${instructors.join(", ")}\n\nGrade breakdown by section and instructor:\n${details}`,
     };
   };
   const sendReportEmails = async () => {
@@ -881,7 +882,24 @@ export default function GradeAnalysis({ mergeEnabled, onMergeChange }: { mergeEn
       setSendingEmails(false);
     }
   };
-  
+  const openReportDrafts = () => {
+  const cc = chairEmails.split(/[;,]/).map((email) => email.trim()).filter(Boolean);
+  const drafts = selectedEmailCourses.map(buildCourseEmail);
+  const unresolved = drafts.flatMap((draft) => draft.missingRecipients);
+  if (unresolved.length) {
+    showToast("error", `No directory email found for: ${[...new Set(unresolved)].join(", ")}.`);
+    return;
+  }
+  let opened = 0;
+  for (const { to, subject, body } of drafts) {
+    if (openOutlookDraft({ to, cc, subject, body })) opened++;
+  }
+  if (opened < drafts.length) {
+    showToast("error", `Opened ${opened} of ${drafts.length} drafts. Allow pop-ups for this site, then try again.`);
+  } else {
+    showToast("success", `${opened} Outlook draft${opened === 1 ? "" : "s"} opened.`);
+  }
+};
   const toggleSort = (key: typeof sortKey) => {
     if (sortKey === key) setSortAsc(!sortAsc);
     else { setSortKey(key); setSortAsc(true); }
@@ -1356,7 +1374,7 @@ export default function GradeAnalysis({ mergeEnabled, onMergeChange }: { mergeEn
           </> : <>
             <button className="grade-email-back" onClick={() => setReviewEmailDrafts(false)}>Edit draft settings</button>
             <div className="grade-email-drafts">{selectedEmailCourses.map((course) => { const draft = buildCourseEmail(course); return <article key={course}><div><strong>{draft.subject}</strong><small>To: {draft.to.join(", ") || "No directory email found"}</small>{draft.missingRecipients.length > 0 && <small>Missing: {draft.missingRecipients.join(", ")}</small>}<small>CC: {chairEmails}</small></div><pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{draft.body}</pre></article>; })}</div>
-            <button className="grade-button grade-button--primary" disabled={sendingEmails || selectedEmailCourses.some((course) => buildCourseEmail(course).missingRecipients.length > 0)} onClick={() => void sendReportEmails()}>{sendingEmails ? "Sending…" : `Send ${selectedEmailCourses.length} ${selectedEmailCourses.length === 1 ? "email" : "emails"}`}</button>
+            <button className="grade-button grade-button--primary" disabled={selectedEmailCourses.length === 0 || selectedEmailCourses.some((course) => buildCourseEmail(course).missingRecipients.length > 0)} onClick={openReportDrafts}>{`Open ${selectedEmailCourses.length} ${selectedEmailCourses.length === 1 ? "draft" : "drafts"} in Outlook`}</button>
           </>}
         </aside>
       </div>}
