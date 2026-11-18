@@ -311,39 +311,6 @@ function getCourseCollege(course: ScheduleCourse): ScheduleCourse["college"] {
   return department === "ASSE" ? getAsseCollege(course.name) : getCollege(department);
 }
 
-const CROSS_LISTED_CODES_BY_TITLE: Record<string, string> = {
-  algorithms: "COSC 3351",
-  bioinformatics: "COSC 4376",
-  cloudcomputing: "ITAP 4315",
-  computergraphics: "COSC 4371",
-  computernetworks: "COEN 3361",
-  computervision: "AINT 4373",
-  discretestructuresandcombinatorialanalysis: "COSC 3332",
-  distributedsystemsinalgorithms: "COSC 4372",
-  ecommerce: "SOEN 4371",
-  formalmethodsinsoftwareengineering: "SOEN 3314",
-  introductiontocryptography: "CSEC 3354",
-  logicandformalverification: "COSC 3357",
-  networkadministration: "ITAP 4362",
-  networkmanagement: "ITAP 2431",
-  networkmanagementlab: "ITAP 2431",
-  networksecurity: "CSEC 3431",
-  networksecuritylab: "CSEC 3431",
-  operatingsystems: "COSC 4361",
-  parallelcomputing: "COSC 4365",
-  programminglanguages: "COSC 4461",
-  programminglanguageslab: "COSC 4461",
-  quantuminformationandcomputation: "COSC 4380",
-  secureecommerce: "ITAP 4376",
-  softwareprojectmanagement: "SOEN 4313",
-  softwaretestingandqualityassurance: "SOEN 4312",
-  specialtopicsimachinelearn: "COSC 4393",
-  systemsprogramming: "ITAP 3411",
-  systemsprogramminglab: "ITAP 3411",
-  webprogramming: "SOEN 2312",
-  webprogramminglab: "SOEN 2312",
-};
-
 // Canonical cross-listed codes from Cross_Listed_Codes.csv.
 const CROSS_LISTED_CODE_MAP: Record<string, string> = {
   "COSC 3351": "COSC 3351",
@@ -410,20 +377,32 @@ const CROSS_LISTED_CODE_MAP: Record<string, string> = {
   "ITAP 2312": "SOEN 2312"
 };
 
-export function canonicalScheduleCode(code: string): string {
-  const normalized = code.trim().toUpperCase().replace(/\s+/g, " ");
-  return CROSS_LISTED_CODE_MAP[normalized] ?? code;
+// The built-in map above is an offline fallback. App.tsx replaces it with the
+// mapping served from Cross_Listed_Codes.csv (GET /api/cross-listed-codes).
+let activeCrossListedMap: Record<string, string> = CROSS_LISTED_CODE_MAP;
+const normalizeCode = (code: string) => code.trim().toUpperCase().replace(/\s+/g, " ");
+
+export function setCrossListedCodeMap(map: Record<string, string>) {
+  activeCrossListedMap = Object.fromEntries(
+    Object.entries(map).map(([original, final]) => [normalizeCode(original), final])
+  );
 }
 
-export function mergeCrossListedCourses(courses: ScheduleCourse[]) {
+export function canonicalScheduleCode(code: string): string {
+  return activeCrossListedMap[normalizeCode(code)] ?? code;
+}
+
+function groupCrossListed(courses: ScheduleCourse[]) {
   const grouped = new Map<string, ScheduleCourse[]>();
   courses.forEach((originalCourse) => {
-    const course = { ...originalCourse, code: canonicalScheduleCode(originalCourse.code) };
+    const code = canonicalScheduleCode(originalCourse.code);
+    const course = { ...originalCourse, code, name: canonicalCourseTitle(code, originalCourse.name) };
+    // Same canonical course + campus + section + meeting pattern + room + instructor = one meeting.
+    // Title is deliberately not part of the key: the canonical code already identifies the course.
     const key = [
-      course.code,
+      code,
       course.gender,
       course.section,
-      normalizeCourseTitle(course.name),
       [...course.days].sort().join(","),
       course.startMinute,
       course.endMinute,
@@ -432,26 +411,30 @@ export function mergeCrossListedCourses(courses: ScheduleCourse[]) {
     ].join("|");
     grouped.set(key, [...(grouped.get(key) ?? []), course]);
   });
-  return [...grouped.values()].map((records) => {
+  return [...grouped.values()];
+}
+
+export function mergeCrossListedCourses(courses: ScheduleCourse[]): ScheduleCourse[] {
+  return groupCrossListed(courses).map((records) => {
     const first = records[0];
-    const normalizedTitle = normalizeCourseTitle(first.name);
-    // Even a single section may have an old cross-listed prefix.
-    // Normalize its code so dropdown filters and schedule display agree.
-    if (records.length === 1) {
-      return first;
-    }
+    // A single record still carries the canonical code, so filters and display agree.
+    if (records.length === 1) return first;
     return {
       ...first,
       id: records.map((record) => record.id).join(" / "),
-      code: first.code,
       maxEnrollment: records.reduce((sum, record) => sum + record.maxEnrollment, 0),
       enrolled: records.reduce((sum, record) => sum + record.enrolled, 0),
       available: records.reduce((sum, record) => sum + record.available, 0),
-      status: records.some((record) => record.status === "Open") ? "Open" as const : "Closed" as const,
+      status: records.some((record) => record.status === "Open") ? ("Open" as const) : ("Closed" as const),
       conflicts: [...new Set(records.flatMap((record) => record.conflicts))],
       conflictDetails: [...new Set(records.flatMap((record) => record.conflictDetails ?? []))],
     };
   });
+}
+
+/** Number of merged groups (cross-listed meetings that collapse into one card). */
+export function countCrossListedMerges(courses: ScheduleCourse[]) {
+  return groupCrossListed(courses).filter((records) => records.length > 1).length;
 }
 
 export function findCrossListedGroups(courses: ScheduleCourse[]): CrossListedGroup[] {

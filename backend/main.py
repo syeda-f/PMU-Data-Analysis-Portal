@@ -13,7 +13,7 @@ import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.schedule_etl import run as run_schedule_etl
+from backend.schedule_etl import run as run_schedule_etl, load_mapping
 from backend.grades_etl import parse_grade_source, rebuild_grade_views, SOURCE_NAMES
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -52,6 +52,17 @@ def require_reference_file(name):
 @app.get("/")
 def root():
     return {"status": "ok", "service": "academic-planning-api"}
+
+
+@app.get("/api/cross-listed-codes")
+def cross_listed_codes():
+    """Original course code -> canonical cross-listed code, read from Cross_Listed_Codes.csv."""
+    path = require_reference_file("Cross_Listed_Codes.csv")
+    try:
+        _, code_map = load_mapping(path)
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return code_map
 
 
 @app.post("/upload-schedule")

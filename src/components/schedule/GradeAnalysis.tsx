@@ -498,7 +498,7 @@ export default function GradeAnalysis({ mergeEnabled, onMergeChange }: { mergeEn
   const [activePanel, setActivePanel] = useState<"analysis" | "report">("analysis");
   const [courseGradeRecords, setCourseGradeRecords] = useState<SectionGradeRecord[]>([]);
   const [reportMode, setReportMode] = useState<ReportMode>("course");
-  const [filters, setFilters] = useState({ semesters: ["202510"], department: "All", course: "GEIT 1411", instructor: "All", campus: "All", mode: "Student Count" as DisplayMode });
+  const [filters, setFilters] = useState({ semesters: ["202510"], department: "All", course: "All", instructor: "All", campus: "All", mode: "Student Count" as DisplayMode });
   const [selectedSections, setSelectedSections] = useState<string[]>([]);
   const [comparisonGrades, setComparisonGrades] = useState<Grade[]>(() => [...grades]);
   const [aType, setAType] = useState<DisplayMode>("Percentage");
@@ -1046,7 +1046,7 @@ export default function GradeAnalysis({ mergeEnabled, onMergeChange }: { mergeEn
       ...current,
       semesters,
       course: (() => {
-        if (courseAvailable && current.course !== "All") return current.course;
+        if (courseAvailable) return current.course;
         if (current.instructor !== "All") return "All";
         if (semesters.length < 2) return "All";
         const counts = new Map<string, Set<string>>();
@@ -1094,7 +1094,7 @@ export default function GradeAnalysis({ mergeEnabled, onMergeChange }: { mergeEn
           </div>
         </details>
       </div>
-      <div className="grade-filter-actions"><button className="grade-reset" onClick={() => { setSelectedSections([]); setReportGenerated(false); setFilters({ semesters: [gradeRecords[0]?.semester ?? "202510"], department: "All", course: gradeRecords.some((record) => record.course === "GEIT 1411") ? "GEIT 1411" : "All", instructor: "All", campus: "All", mode: "Student Count" }); }}>Reset</button></div>
+      <div className="grade-filter-actions"><button className="grade-reset" onClick={() => { setSelectedSections([]); setReportGenerated(false); setFilters({ semesters: [gradeRecords[0]?.semester ?? "202510"], department: "All", course: "All", instructor: "All", campus: "All", mode: "Student Count" }); }}>Reset</button></div>
     </section>
   );
 

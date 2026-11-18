@@ -6,7 +6,7 @@ import GradeAnalysis from "./GradeAnalysis";
 import { collegeProfessors } from "./collegeProfessors";
 import { CCES_MAJORS, ccesCourseCatalog, collegeCodeRules, type CcesMajor } from "./courseCatalogData";
 import { scheduleCourses } from "./scheduleData";
-import { canonicalCourseTitle, canonicalScheduleCode, findCrossListedGroups, inferRoomCapacity, mergeCrossListedCourses, detectScheduleSemester, parseScheduleFile, recalculateConflicts, type Campus, type ConflictType, type ScheduleCourse } from "./scheduleImport";
+import { canonicalCourseTitle, canonicalScheduleCode, countCrossListedMerges, findCrossListedGroups, setCrossListedCodeMap, inferRoomCapacity, mergeCrossListedCourses, detectScheduleSemester, parseScheduleFile, recalculateConflicts, type Campus, type ConflictType, type ScheduleCourse } from "./scheduleImport";
 import {
   initialExams,
   type Exam,
@@ -114,6 +114,15 @@ function courseBelongsToCollege(code: string, college: string, title = "") {
     ) ||
     (college === "CCES" && ccesCourseCatalog.some((item) => item.code === code))
   );
+}
+
+// Department filter = course prefix: ITAP -> only ITAP courses, several departments -> their union.
+// For CCES, ASSE courses count under the major named in their title and CSEC counts as CYSC.
+function departmentMatchesCourse(course: Course, departments: string[], ccesMode: boolean) {
+  if (departments.length === 0) return true;
+  if (!ccesMode) return departments.includes(getCourseParts(course.code).prefix);
+  const department = getCcesColorPrefix(course);
+  return departments.some((selected) => (selected === "CSEC" ? "CYSC" : selected) === department);
 }
 
 function keepValidSelections(current: string[], options: readonly string[]) {
@@ -776,6 +785,17 @@ export default function App() {
     setNumericCodes([]);
     setCourseNames([]);
   }, [mergeCrossListed]);
+  // Cross-listed code mapping comes from Cross_Listed_Codes.csv on the backend.
+  // The built-in mapping stays as a fallback if the request fails.
+  const [crossListMapVersion, setCrossListMapVersion] = useState(0);
+  useEffect(() => {
+    scheduleApi<Record<string, string>>("/api/cross-listed-codes")
+      .then((map) => {
+        setCrossListedCodeMap(map);
+        setCrossListMapVersion((version) => version + 1);
+      })
+      .catch(() => { /* keep the built-in mapping */ });
+  }, []);
   const [showFilters, setShowFilters] = useState(true);
   const [showCourseConfig, setShowCourseConfig] = useState(false);
   const [configuredCourses, setConfiguredCourses] = useState<string[]>(() =>
@@ -823,19 +843,29 @@ export default function App() {
     document.documentElement.style.colorScheme = theme;
   }, [theme]);
 
+  // Normalize cross-listed records before applying filters or building dropdown options.
+  const scheduleViewCourses = useMemo(
+    () => mergeCrossListed ? mergeCrossListedCourses(courses) : courses,
+    [courses, mergeCrossListed, crossListMapVersion]
+  );
+  const crossListedMergeCount = useMemo(
+    () => countCrossListedMerges(courses.filter((course) => campusTab === "All" || course.gender === campusTab)),
+    [courses, campusTab, crossListMapVersion]
+  );
+
   const currentMeta = useMemo(
     () => ({
-      totalSections: courses.length,
-      femaleSections: courses.filter((course) => course.gender === "Female").length,
-      maleSections: courses.filter((course) => course.gender === "Male").length,
-      openSections: courses.filter((course) => course.status === "Open").length,
-      closedSections: courses.filter((course) => course.status === "Closed").length,
-      conflictSections: courses.filter((course) => course.conflicts.length > 0).length,
-      rooms: new Set(courses.filter((course) => course.room !== "-").map((course) => course.room)).size,
-      enrollment: courses.reduce((total, course) => total + course.enrolled, 0),
-      capacityIssues: courses.filter((course) => course.conflicts.includes("capacity")).length,
+      totalSections: scheduleViewCourses.length,
+      femaleSections: scheduleViewCourses.filter((course) => course.gender === "Female").length,
+      maleSections: scheduleViewCourses.filter((course) => course.gender === "Male").length,
+      openSections: scheduleViewCourses.filter((course) => course.status === "Open").length,
+      closedSections: scheduleViewCourses.filter((course) => course.status === "Closed").length,
+      conflictSections: scheduleViewCourses.filter((course) => course.conflicts.length > 0).length,
+      rooms: new Set(scheduleViewCourses.filter((course) => course.room !== "-").map((course) => course.room)).size,
+      enrollment: scheduleViewCourses.reduce((total, course) => total + course.enrolled, 0),
+      capacityIssues: scheduleViewCourses.filter((course) => course.conflicts.includes("capacity")).length,
     }),
-    [courses]
+    [scheduleViewCourses]
   );
   const examMeta = useMemo(() => {
     const total = exams.length;
@@ -889,12 +919,6 @@ export default function App() {
     return imported.length;
   };
 
-  // Normalize cross-listed records before applying filters or building dropdown options.
-  const scheduleViewCourses = useMemo(
-    () => mergeCrossListed ? mergeCrossListedCourses(courses) : courses,
-    [courses, mergeCrossListed]
-  );
-
   const filteredCourses = useMemo(
     () =>
       scheduleViewCourses.filter((course) => {
@@ -905,9 +929,7 @@ export default function App() {
           CCES_MAJORS.includes(department as CcesMajor)
         );
         const ccesSelected = colleges.includes("CCES") || selectedMajors.length > 0;
-        const isMajorCourse =
-          selectedMajors.length === 0 ||
-          ccesRows.some((item) => selectedMajors.some((major) => item.majors.includes(major)));
+        const isMajorCourse = departmentMatchesCourse(course, departments, true);
         const isElective =
           selectedMajors.length > 0 &&
           !selectedMajors.includes(prefix as CcesMajor) &&
@@ -1120,6 +1142,21 @@ export default function App() {
       ),
     [campusTab, colleges, scheduleViewCourses]
   );
+  // The Department list itself always uses the full pool. Every other dropdown is narrowed
+  // to the selected departments, then further to the selected prefixes / codes.
+  const departmentScopedPool = useMemo(() => {
+    if (departments.length === 0) return courseOptionPool;
+    const ccesMode = colleges.includes("CCES") || departments.some((department) => CCES_MAJORS.includes(department as CcesMajor));
+    return courseOptionPool.filter((course) => departmentMatchesCourse(course, departments, ccesMode));
+  }, [courseOptionPool, departments, colleges]);
+  const refinedPool = useMemo(
+    () => departmentScopedPool.filter((course) => {
+      const { prefix, numeric } = getCourseParts(course.code);
+      return (prefixes.length === 0 || prefixes.includes(prefix)) &&
+        (numericCodes.length === 0 || numericCodes.includes(numeric));
+    }),
+    [departmentScopedPool, prefixes, numericCodes]
+  );
   const courseDepartments = useMemo(
     () => colleges.includes("CCES")
       ? [...CCES_MAJORS]
@@ -1127,23 +1164,23 @@ export default function App() {
     [colleges, courseOptionPool]
   );
   const coursePrefixes = useMemo(
-    () => Array.from(new Set(courseOptionPool.map((course) => getCourseParts(course.code).prefix))).sort(),
-    [courseOptionPool]
+    () => Array.from(new Set(departmentScopedPool.map((course) => getCourseParts(course.code).prefix))).sort(),
+    [departmentScopedPool]
   );
   const courseNumericCodes = useMemo(
     () => Array.from(new Set(
-      courseOptionPool
+      departmentScopedPool
         .filter((course) => prefixes.length === 0 || prefixes.includes(getCourseParts(course.code).prefix))
         .map((course) => getCourseParts(course.code).numeric)
         .filter(Boolean)
     )).sort((a, b) => a.localeCompare(b, undefined, { numeric: true })),
-    [courseOptionPool, prefixes]
+    [departmentScopedPool, prefixes]
   );
   const courseNameOptions = useMemo(() => Array.from(new Set(
-    courseOptionPool.map((course) => colleges.includes("CCES")
+    refinedPool.map((course) => colleges.includes("CCES")
       ? canonicalCourseTitle(course.code, course.name)
       : course.name)
-  )).sort(), [colleges, courseOptionPool]);
+  )).sort(), [colleges, refinedPool]);
   const selectedCcesMajors = departments.filter((department): department is CcesMajor =>
     CCES_MAJORS.includes(department as CcesMajor)
   );
@@ -1163,36 +1200,41 @@ export default function App() {
     [configurableCourseRows]
   );
   const courseInstructors = useMemo<string[]>(() => {
+    if (departments.length > 0 || prefixes.length > 0 || numericCodes.length > 0) {
+      return Array.from(new Set(refinedPool.map((course) => course.instructor)))
+        .filter((name) => !["", "Unassigned", "NAME NOT FOUND FOR PIDM:"].includes(name))
+        .sort();
+    }
     const selectedColleges = colleges.length ? colleges : Object.keys(collegeProfessors);
     return Array.from(new Set(selectedColleges.flatMap((college) =>
       collegeProfessors[college as keyof typeof collegeProfessors] ?? []
     ))).sort();
-  }, [colleges]);
+  }, [colleges, departments, prefixes, numericCodes, refinedPool]);
   const courseRooms = useMemo(
-    () => Array.from(new Set(courseOptionPool.map((course) => course.room))).sort(),
-    [courseOptionPool]
+    () => Array.from(new Set(refinedPool.map((course) => course.room))).sort(),
+    [refinedPool]
   );
   const courseLevels = useMemo(
     () =>
       ["Prep", "Freshman", "Sophomore", "Junior", "Senior"].filter((level) =>
-        courseOptionPool.some((course) => getCourseLevel(course.code) === level)
+        refinedPool.some((course) => getCourseLevel(course.code) === level)
       ),
-    [courseOptionPool]
+    [refinedPool]
   );
   const courseStatuses = useMemo(
-    () => ["Open", "Closed"].filter((option) => courseOptionPool.some((course) => course.status === option)),
-    [courseOptionPool]
+    () => ["Open", "Closed"].filter((option) => refinedPool.some((course) => course.status === option)),
+    [refinedPool]
   );
   const availableTypes = useMemo(
-    () => ["Lecture", "Lab"].filter((option) => courseOptionPool.some((course) => course.roomType === option)),
-    [courseOptionPool]
+    () => ["Lecture", "Lab"].filter((option) => refinedPool.some((course) => course.roomType === option)),
+    [refinedPool]
   );
   const availableTimeSlots = useMemo(
     () =>
       TIMES.filter((_, index) =>
-        courseOptionPool.some((course) => (index + 8) * 60 < course.endMinute && (index + 9) * 60 > course.startMinute)
+        refinedPool.some((course) => (index + 8) * 60 < course.endMinute && (index + 9) * 60 > course.startMinute)
       ),
-    [courseOptionPool]
+    [refinedPool]
   );
 
   const recommendationCollegePool = useMemo(
@@ -1358,12 +1400,18 @@ export default function App() {
         : next;
     });
     setTimeSlots((current) => keepValidSelections(current, availableTimeSlots));
+    setPrefixes((current) => keepValidSelections(current, coursePrefixes));
+    setNumericCodes((current) => keepValidSelections(current, courseNumericCodes));
+    setCourseNames((current) => keepValidSelections(current, courseNameOptions));
   }, [
     availableTimeSlots,
     availableTypes,
     courseDepartments,
     courseInstructors,
     courseLevels,
+    courseNameOptions,
+    courseNumericCodes,
+    coursePrefixes,
     courseRooms,
     courseStatuses,
   ]);
@@ -1423,7 +1471,7 @@ export default function App() {
           >
             <Icon name="calendar" size={16} />
             <span>Course Schedule</span>
-            <b>{courses.length} sections</b>
+            <b>{scheduleViewCourses.length} sections</b>
           </button>
           <button
             className={`main-nav-tab ${activeTab === "grades" ? "main-nav-tab--active" : ""}`}
@@ -1606,7 +1654,7 @@ export default function App() {
                           onChange={(values) => {
                             setPrefixes(values);
                             const validCodes = Array.from(new Set(
-                              courseOptionPool
+                              departmentScopedPool
                                 .filter((course) => values.length === 0 || values.includes(getCourseParts(course.code).prefix))
                                 .map((course) => getCourseParts(course.code).numeric)
                                 .filter(Boolean)
@@ -1674,7 +1722,7 @@ export default function App() {
                 <div className="schedule-main">
                   <div className="campus-tabs" role="tablist" aria-label="Campus schedule">
                 {(["All", "Female", "Male"] as const).map((campus) => {
-                  const count = campus === "All" ? courses.length : courses.filter((course) => course.gender === campus).length;
+                  const count = campus === "All" ? scheduleViewCourses.length : scheduleViewCourses.filter((course) => course.gender === campus).length;
                   return (
                     <button
                       key={campus}
@@ -1722,7 +1770,7 @@ export default function App() {
                   <input type="checkbox" checked={mergeCrossListed} onChange={(event) => setMergeCrossListed(event.target.checked)} />
                   <span className="toggle-track"><i></i></span>
                   Merge cross-listed
-                  <b>{findCrossListedGroups(filteredCourses).length}</b>
+                  <b>{crossListedMergeCount}</b>
                 </label>
                   </div>
 
