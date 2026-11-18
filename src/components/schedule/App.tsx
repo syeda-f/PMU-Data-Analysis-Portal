@@ -1260,7 +1260,7 @@ export default function App() {
           (colleges.length === 0 || colleges.some((college) => courseBelongsToCollege(course.code, college, course.name))) &&
           (!colleges.includes("CCES") || activeCcesCatalog.some((item) => (mergeCrossListed ? canonicalScheduleCode(item.code) : item.code) === course.code) || selectedElectiveCodes.has(course.code))
       ),
-    [campusTab, colleges, scheduleViewCourses]
+    [campusTab, colleges, scheduleViewCourses, activeCcesCatalog, selectedElectiveCodes, mergeCrossListed]
   );
   // The Department list itself always uses the full pool. Every other dropdown is narrowed
   // to the selected departments, then further to the selected prefixes / codes.
