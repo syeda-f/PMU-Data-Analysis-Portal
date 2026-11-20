@@ -1987,7 +1987,7 @@ export default function App() {
             </section>
           </div>
         ) : activeTab === "grades" ? (
-          <GradeAnalysis mergeEnabled={mergeCrossListed} onMergeChange={setMergeCrossListed} />
+          <GradeAnalysis />
         ) : (
           /* ========================================================= */
           /* EXAM SCHEDULE VIEW                                        */
