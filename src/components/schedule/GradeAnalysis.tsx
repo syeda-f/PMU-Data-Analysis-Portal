@@ -955,7 +955,8 @@ export default function GradeAnalysis() {
   }, [sections, variationThreshold]);
   const notableSectionDifferences = allNotableSectionDifferences;
   // One row per instructor picked in the chart dropdown: all of that instructor's sections of the course are totalled.
-  const instructorBarRows = useMemo<InstructorComparisonRow[]>(() => activeChartInstructors.map((name) => {
+  const barInstructorNames = activeChartInstructors.length ? activeChartInstructors : comparisonEnabled && multiSemesterView === "bars" ? chartInstructorOptions : [];
+  const instructorBarRows = useMemo<InstructorComparisonRow[]>(() => barInstructorNames.map((name) => {
     const row: InstructorComparisonRow = { instructor: name, sections: 0, totalStudents: 0, grades: Object.fromEntries(allGrades.map((grade) => [grade, 0])) as Record<Grade, number> };
     gradeRecords.filter((record) =>
       filters.semesters.includes(record.semester) &&
@@ -968,7 +969,7 @@ export default function GradeAnalysis() {
       allGrades.forEach((grade) => { row.grades[grade] += record.grades[grade]; });
     });
     return row;
-  }).filter((row) => row.sections > 0), [activeChartInstructors, filters.campus, filters.course, filters.semesters, gradeRecords]);
+  }).filter((row) => row.sections > 0), [barInstructorNames.join("|"), filters.campus, filters.course, filters.semesters, gradeRecords]);
   // Bars (one per instructor, totalled over every selected semester) replace the line chart when picked in multi-semester view.
   const showInstructorBars = instructorBarRows.length > 0 && (!comparisonEnabled || multiSemesterView === "bars");
   const instructorVariations = useMemo(() => {
@@ -1441,7 +1442,7 @@ export default function GradeAnalysis() {
                 {chartInstructorOptions.map((name) => <label key={name}><input type="checkbox" checked={activeChartInstructors.includes(name)} onChange={() => setChartInstructors((current) => { const base = current.filter((value) => chartInstructorOptions.includes(value)); return base.includes(name) ? base.filter((value) => value !== name) : [...base, name]; })} /><i style={{ background: instructorColors[chartInstructorOptions.indexOf(name) % instructorColors.length] }} /><span>{name}</span></label>)}
               </div>
             </details>}
-            {comparisonEnabled && activeChartInstructors.length > 0 && <div className="grade-segment" role="tablist" aria-label="Chart type">{([["lines", "Lines"], ["bars", "Bars (total)"]] as const).map(([value, label]) => <button key={value} className={multiSemesterView === value ? "active" : ""} onClick={() => setMultiSemesterView(value)}>{label}</button>)}</div>}
+            {comparisonEnabled && filters.course !== "All" && <div className="grade-segment" role="tablist" aria-label="Chart type">{([["lines", "Lines"], ["bars", "Bars (total)"]] as const).map(([value, label]) => <button key={value} className={multiSemesterView === value ? "active" : ""} onClick={() => setMultiSemesterView(value)}>{label}</button>)}</div>}
             {comparisonEnabled && !showInstructorBars && <details className="grade-comparison-grade-filter">
               <summary>{comparisonGrades.length} grade categories</summary>
               <div>
