@@ -534,12 +534,12 @@ function GradeTooltip({ record, grade, seriesLabel, instructor, selectionTotal }
   );
 }
 
-type InstructorComparisonRow = { instructor: string; sections: number; totalStudents: number; grades: Record<Grade, number> };
+type InstructorComparisonRow = { instructor: string; sections: number; totalStudents: number; grades: Record<Grade, number>; isSection?: boolean; color?: string };
 
 // Grouped bars, one bar per instructor in each grade group. Percentages are of each instructor's own students.
 function InstructorBarsChart({ rows, allNames, mode, course }: { rows: InstructorComparisonRow[]; allNames: string[]; mode: DisplayMode; course: string }) {
   const pct = (count: number, totalStudents: number) => totalStudents ? count / totalStudents * 100 : 0;
-  const colorFor = (name: string) => instructorColors[Math.max(0, allNames.indexOf(name)) % instructorColors.length];
+  const colorFor = (row: InstructorComparisonRow) => row.color ?? instructorColors[Math.max(0, allNames.indexOf(row.instructor)) % instructorColors.length];
   const valueFor = (row: InstructorComparisonRow, grade: Grade) => mode === "Percentage" ? pct(row.grades[grade], row.totalStudents) : row.grades[grade];
   const rawMaximum = Math.max(0, ...rows.flatMap((row) => grades.map((grade) => valueFor(row, grade))));
   const maximum = mode === "Percentage" ? Math.max(10, Math.min(100, Math.ceil(rawMaximum / 10) * 10)) : Math.max(5, Math.ceil(rawMaximum / 5) * 5);
@@ -551,7 +551,7 @@ function InstructorBarsChart({ rows, allNames, mode, course }: { rows: Instructo
   const label = (row: InstructorComparisonRow, grade: Grade) => mode === "Percentage" ? `${pct(row.grades[grade], row.totalStudents).toFixed(1)}%` : String(row.grades[grade]);
   if (rows.length === 0) return <p role="status">No records for the selected instructors.</p>;
   return <>
-    <div className="grade-chart-legend grade-chart-legend--single-line">{rows.map((row, index) => <span key={row.instructor}><i style={{ background: colorFor(row.instructor) }} /><b>{index + 1}. {row.instructor} · {row.sections} {row.sections === 1 ? "section" : "sections"} · {row.totalStudents.toLocaleString()} students</b></span>)}</div>
+    <div className="grade-chart-legend grade-chart-legend--single-line">{rows.map((row, index) => <span key={row.instructor}><i style={{ background: colorFor(row) }} /><b>{index + 1}. {row.instructor} · {row.isSection ? "" : `${row.sections} ${row.sections === 1 ? "section" : "sections"} · `}{row.totalStudents.toLocaleString()} students</b></span>)}</div>
     <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${course} grades by instructor`} style={{ width: "100%", height: "auto" }}>
       {[0, 1, 2, 3, 4].map((tick) => {
         const value = maximum * tick / 4;
@@ -568,10 +568,10 @@ function InstructorBarsChart({ rows, allNames, mode, course }: { rows: Instructo
             const top = y(value);
             const x = groupStart + rowIndex * barWidth;
             return <g key={row.instructor}>
-              <rect x={x} y={top} width={Math.max(1, barWidth - 3)} height={padding.top + plotHeight - top} fill={colorFor(row.instructor)} stroke="#fff" strokeWidth="1">
+              <rect x={x} y={top} width={Math.max(1, barWidth - 3)} height={padding.top + plotHeight - top} fill={colorFor(row)} stroke="#fff" strokeWidth="1">
                 <title>{`${row.instructor} · Grade ${gradeLabels[grade as Exclude<Grade, "P">]}: ${row.grades[grade]} students (${pct(row.grades[grade], row.totalStudents).toFixed(1)}% of ${row.totalStudents} students) across ${row.sections} section${row.sections === 1 ? "" : "s"}`}</title>
               </rect>
-              {rows.length <= 6 && <text transform={`translate(${x + (barWidth - 3) / 2 + 4},${top - 6}) rotate(-90)`} textAnchor="start" fontSize="12" fontWeight="700" fill="#18243B">{label(row, grade)}</text>}
+              {rows.length <= 12 && <text transform={`translate(${x + (barWidth - 3) / 2 + 4},${top - 6}) rotate(-90)`} textAnchor="start" fontSize={rows.length > 8 ? 10 : 12} fontWeight="700" fill="#18243B">{label(row, grade)}</text>}
               {barWidth >= 14 && padding.top + plotHeight - top >= 18 && <text x={x + (barWidth - 3) / 2} y={padding.top + plotHeight - 6} textAnchor="middle" fontSize="11" fontWeight="800" fill="#fff" stroke="#000" strokeWidth="3" paintOrder="stroke">{rowIndex + 1}</text>}
             </g>;
           })}
@@ -619,6 +619,7 @@ export default function GradeAnalysis() {
   const [selectedSections, setSelectedSections] = useState<string[]>([]);
   const [comparisonGrades, setComparisonGrades] = useState<Grade[]>(() => [...grades]);
   const [chartInstructors, setChartInstructors] = useState<string[]>([]);
+  const [barGrouping, setBarGrouping] = useState<"section" | "instructor">("section");
   const [multiSemesterView, setMultiSemesterView] = useState<"lines" | "bars">("lines");
   const [aType, setAType] = useState<DisplayMode>("Percentage");
   const [aThreshold, setAThreshold] = useState(20);
@@ -956,7 +957,18 @@ export default function GradeAnalysis() {
   const notableSectionDifferences = allNotableSectionDifferences;
   // One row per instructor picked in the chart dropdown: all of that instructor's sections of the course are totalled.
   const barInstructorNames = activeChartInstructors.length ? activeChartInstructors : comparisonEnabled && multiSemesterView === "bars" ? chartInstructorOptions : [];
-  const instructorBarRows = useMemo<InstructorComparisonRow[]>(() => barInstructorNames.map((name) => {
+  const instructorBarRows = useMemo<InstructorComparisonRow[]>(() => barGrouping === "section" ? barInstructorNames.flatMap((name) => gradeRecords.filter((record) =>
+    filters.semesters.includes(record.semester) &&
+    record.course === filters.course &&
+    (filters.campus === "All" || record.campus.startsWith(filters.campus)) &&
+    instructorMatches(record.instructor, name)
+  ).sort((x, y) => x.semester.localeCompare(y.semester) || x.section.localeCompare(y.section, undefined, { numeric: true })).map((record) => ({
+    instructor: `${barInstructorNames.length > 1 ? `${name} · ` : ""}${filters.semesters.length > 1 ? `${semesterLabel(record.semester)} · ` : ""}Sec ${record.section} · ${record.campus.replace(" Campus", "")}`,
+    sections: 1,
+    totalStudents: record.totalStudents,
+    grades: { ...record.grades },
+    isSection: true,
+  }))).map((row, index) => ({ ...row, color: instructorColors[index % instructorColors.length] })) : barInstructorNames.map((name) => {
     const row: InstructorComparisonRow = { instructor: name, sections: 0, totalStudents: 0, grades: Object.fromEntries(allGrades.map((grade) => [grade, 0])) as Record<Grade, number> };
     gradeRecords.filter((record) =>
       filters.semesters.includes(record.semester) &&
@@ -969,7 +981,7 @@ export default function GradeAnalysis() {
       allGrades.forEach((grade) => { row.grades[grade] += record.grades[grade]; });
     });
     return row;
-  }).filter((row) => row.sections > 0), [barInstructorNames.join("|"), filters.campus, filters.course, filters.semesters, gradeRecords]);
+  }).filter((row) => row.sections > 0), [barGrouping, barInstructorNames.join("|"), filters.campus, filters.course, filters.semesters, gradeRecords]);
   // Bars (one per instructor, totalled over every selected semester) replace the line chart when picked in multi-semester view.
   const showInstructorBars = instructorBarRows.length > 0 && (!comparisonEnabled || multiSemesterView === "bars");
   const instructorVariations = useMemo(() => {
@@ -1432,7 +1444,7 @@ export default function GradeAnalysis() {
 
       <section className="grade-panel grade-chart-card">
         <div className="grade-card-heading">
-          <div><h2>{showInstructorBars ? `${filters.course} Grade Distribution by Instructor` : comparisonEnabled ? `${filters.course !== "All" ? filters.course : filters.instructor} Grade Distribution Across Semesters` : "Grade Distribution Across Letter Grades"}</h2>{comparisonEnabled && !showInstructorBars && <p>All matching sections are aggregated within each semester before percentages are calculated{activeChartInstructors.length ? ` · instructors: ${activeChartInstructors.join(", ")}` : ""}.</p>}{showInstructorBars && <p>All sections each instructor taught for this course{filters.semesters.length > 1 ? ` across the ${filters.semesters.length} selected semesters` : ""} are totalled; percentages are of that instructor&apos;s own students.</p>}</div>
+          <div><h2>{showInstructorBars ? `${filters.course} Grade Distribution by Instructor` : comparisonEnabled ? `${filters.course !== "All" ? filters.course : filters.instructor} Grade Distribution Across Semesters` : "Grade Distribution Across Letter Grades"}</h2>{comparisonEnabled && !showInstructorBars && <p>All matching sections are aggregated within each semester before percentages are calculated{activeChartInstructors.length ? ` · instructors: ${activeChartInstructors.join(", ")}` : ""}.</p>}{showInstructorBars && <p>{barGrouping === "section" ? "One bar per section the selected instructors taught; percentages are of each section's own students." : `All sections each instructor taught for this course${filters.semesters.length > 1 ? ` across the ${filters.semesters.length} selected semesters` : ""} are totalled; percentages are of that instructor's own students.`}</p>}</div>
           <div className="grade-chart-actions">
             {filters.course !== "All" && chartInstructorOptions.length > 0 && <details className="grade-comparison-grade-filter">
               <summary>{activeChartInstructors.length ? `${activeChartInstructors.length} ${activeChartInstructors.length === 1 ? "instructor" : "instructors"}` : "All instructors"}</summary>
@@ -1442,6 +1454,7 @@ export default function GradeAnalysis() {
                 {chartInstructorOptions.map((name) => <label key={name}><input type="checkbox" checked={activeChartInstructors.includes(name)} onChange={() => setChartInstructors((current) => { const base = current.filter((value) => chartInstructorOptions.includes(value)); return base.includes(name) ? base.filter((value) => value !== name) : [...base, name]; })} /><i style={{ background: instructorColors[chartInstructorOptions.indexOf(name) % instructorColors.length] }} /><span>{name}</span></label>)}
               </div>
             </details>}
+            {showInstructorBars && <div className="grade-segment" role="tablist" aria-label="Bar grouping">{([["section", "By section"], ["instructor", "Instructor total"]] as const).map(([value, label]) => <button key={value} className={barGrouping === value ? "active" : ""} onClick={() => setBarGrouping(value)}>{label}</button>)}</div>}
             {comparisonEnabled && filters.course !== "All" && <div className="grade-segment" role="tablist" aria-label="Chart type">{([["lines", "Lines"], ["bars", "Bars (total)"]] as const).map(([value, label]) => <button key={value} className={multiSemesterView === value ? "active" : ""} onClick={() => setMultiSemesterView(value)}>{label}</button>)}</div>}
             {comparisonEnabled && !showInstructorBars && <details className="grade-comparison-grade-filter">
               <summary>{comparisonGrades.length} grade categories</summary>
