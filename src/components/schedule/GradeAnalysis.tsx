@@ -973,46 +973,6 @@ export default function GradeAnalysis() {
   })).filter((row) => row.sections > 0).map((row, index) => ({ ...row, color: instructorColors[index % instructorColors.length] })), [barInstructorNames.join("|"), filters.campus, filters.course, filters.semesters, gradeRecords]);
   // Bars (one per instructor, totalled over every selected semester) replace the line chart when picked in multi-semester view.
   const showInstructorBars = instructorBarRows.length > 0 && (!comparisonEnabled || multiSemesterView === "bars");
-  const instructorVariations = useMemo(() => {
-    const byCourse = new Map<string, SectionGradeRecord[]>();
-    sections.forEach((record) => {
-      const key = `${record.semester}|${record.course}`;
-      byCourse.set(key, [...(byCourse.get(key) ?? []), record]);
-    });
-    const measures = [
-      { label: "Combined A+/A", count: (value: Record<Grade, number>) => value["A+"] + value.A },
-      { label: "Combined D & F", count: (value: Record<Grade, number>) => value["D&Below"] },
-    ];
-    return [...byCourse.values()].flatMap((records) => {
-      const byInstructor = new Map<string, InstructorComparisonRow>();
-      records.forEach((record) => {
-        const row = byInstructor.get(record.instructor) ?? { instructor: record.instructor, sections: 0, totalStudents: 0, grades: Object.fromEntries(allGrades.map((grade) => [grade, 0])) as Record<Grade, number> };
-        row.sections += 1;
-        row.totalStudents += record.totalStudents;
-        allGrades.forEach((grade) => { row.grades[grade] += record.grades[grade]; });
-        byInstructor.set(record.instructor, row);
-      });
-      const instructorGroups = [...byInstructor.values()].filter((row) => row.totalStudents >= minimumStudents);
-      if (instructorGroups.length < 2) return [];
-      return measures.map((measure) => {
-        const ranked = instructorGroups.map((row) => ({ row, rate: row.totalStudents ? measure.count(row.grades) / row.totalStudents * 100 : 0 })).sort((a, b) => b.rate - a.rate);
-        return { course: records[0].course, semester: records[0].semester, title: records[0].title, measure: measure.label, highest: ranked[0], lowest: ranked[ranked.length - 1], difference: ranked[0].rate - ranked[ranked.length - 1].rate };
-      }).filter((item) => item.difference >= variationThreshold);
-    }).sort((a, b) => b.difference - a.difference);
-  }, [sections, variationThreshold, minimumStudents]);
-  // Instructor Comparison: every instructor's sections of a course are totalled across the selected semesters, with a count per grade.
-  const instructorGradeTable = useMemo(() => {
-    const groups = new Map<string, { course: string; title: string; instructor: string; sections: number; totalStudents: number; grades: Record<Grade, number> }>();
-    sections.forEach((record) => {
-      const key = `${record.course}|${record.instructor}`;
-      const row = groups.get(key) ?? { course: record.course, title: record.title, instructor: record.instructor, sections: 0, totalStudents: 0, grades: Object.fromEntries(allGrades.map((grade) => [grade, 0])) as Record<Grade, number> };
-      row.sections += 1;
-      row.totalStudents += record.totalStudents;
-      allGrades.forEach((grade) => { row.grades[grade] += record.grades[grade]; });
-      groups.set(key, row);
-    });
-    return [...groups.values()].sort((a, b) => a.course.localeCompare(b.course) || a.instructor.localeCompare(b.instructor));
-  }, [sections]);
   const topPerformingSections = useMemo(() => sections.filter((record) => {
     const count = gradeRangeCount(record, highGradeRange);
     const value = aType === "Percentage" ? percent(count, record) : count;
@@ -1157,17 +1117,7 @@ export default function GradeAnalysis() {
     `Section Grade Variation Analysis >= ${variationThreshold} percentage points (${notableSectionDifferences.length})`,
     ...notableSectionDifferences.map((item) => `${semesterLabel(item.semester)} | ${item.course} - ${item.title} | ${item.measure}: ${item.difference.toFixed(1)} pp | Section ${item.highest.record.section} (${item.highest.record.campus}, ${item.highest.record.totalStudents} students) ${item.highest.rate.toFixed(1)}% vs Section ${item.lowest.record.section} (${item.lowest.record.campus}, ${item.lowest.record.totalStudents} students) ${item.lowest.rate.toFixed(1)}%`),
   ];
-  const instructorVariationLines = [
-    "",
-    `Instructor Grade Variation >= ${variationThreshold} percentage points (${instructorVariations.length})`,
-    ...instructorVariations.map((item) => `${semesterLabel(item.semester)} | ${item.course} - ${item.title} | ${item.measure}: ${item.difference.toFixed(1)} pp | ${item.highest.row.instructor} (${item.highest.row.sections} sections, ${item.highest.row.totalStudents} students) ${item.highest.rate.toFixed(1)}% vs ${item.lowest.row.instructor} (${item.lowest.row.sections} sections, ${item.lowest.row.totalStudents} students) ${item.lowest.rate.toFixed(1)}%`),
-  ];
-  const instructorComparisonLines = [
-    "",
-    `Instructor Comparison (${instructorGradeTable.length} instructor-course rows, totalled across the selected semesters)`,
-    ...instructorGradeTable.map((row) => `${row.course} - ${row.title} | ${row.instructor} | ${row.sections} sections, ${row.totalStudents} students | ${grades.map((grade) => `${comparisonGradeLabel(grade)} ${row.grades[grade]} (${row.totalStudents ? (row.grades[grade] / row.totalStudents * 100).toFixed(1) : "0.0"}%)`).join(", ")}`),
-  ];
-  const reportLines = reportMode === "course" ? [...courseReportLines, ...instructorVariationLines, ...instructorComparisonLines] : [...sectionReportLines, ...instructorVariationLines, ...instructorComparisonLines];
+  const reportLines = reportMode === "course" ? courseReportLines : sectionReportLines;
 
   const exportExcel = () => {
     const workbook = XLSX.utils.book_new();
@@ -1189,36 +1139,6 @@ export default function GradeAnalysis() {
       { Setting: "Low-performance Sections to Display", Value: atRiskSectionCount },
       { Setting: "Section Variation Threshold", Value: variationThreshold, Type: "Percentage Points" },
     ]), "Criteria");
-    const appendInstructorComparisonSheet = () => {
-      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(instructorGradeTable.map((row) => ({
-        Course: row.course,
-        "Course Name": row.title,
-        Instructor: row.instructor,
-        Sections: row.sections,
-        Students: row.totalStudents,
-        ...Object.fromEntries(grades.flatMap((grade) => [
-          [`${comparisonGradeLabel(grade)} Count`, row.grades[grade]],
-          [`${comparisonGradeLabel(grade)} %`, row.totalStudents ? row.grades[grade] / row.totalStudents : 0],
-        ])),
-      }))), "Instructor Comparison");
-    };
-    const appendInstructorVariationSheet = () => {
-      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(instructorVariations.map((item) => ({
-        Semester: semesterLabel(item.semester),
-        Course: item.course,
-        "Course Name": item.title,
-        "Grade Measure": item.measure,
-        "Difference (percentage points)": item.difference,
-        "Highest Instructor": item.highest.row.instructor,
-        "Highest Instructor Sections": item.highest.row.sections,
-        "Highest Instructor Students": item.highest.row.totalStudents,
-        "Highest Percentage": item.highest.rate / 100,
-        "Lowest Instructor": item.lowest.row.instructor,
-        "Lowest Instructor Sections": item.lowest.row.sections,
-        "Lowest Instructor Students": item.lowest.row.totalStudents,
-        "Lowest Percentage": item.lowest.rate / 100,
-      }))), "Instructor Variation");
-    };
     if (reportMode === "section") {
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(topPerformingSections.map((record, index) => ({
         Rank: index + 1,
@@ -1257,8 +1177,6 @@ export default function GradeAnalysis() {
         "Lowest Section Students": item.lowest.record.totalStudents,
         "Lowest Percentage": item.lowest.rate / 100,
       }))), "Notable Differences");
-      appendInstructorVariationSheet();
-      appendInstructorComparisonSheet();
       XLSX.writeFileXLSX(workbook, "PMU_CCES_Section_Grade_Analysis_Report.xlsx");
       return;
     }
@@ -1292,8 +1210,6 @@ export default function GradeAnalysis() {
         ...record.grades,
       };
     })), "Low Performance");
-    appendInstructorVariationSheet();
-    appendInstructorComparisonSheet();
     XLSX.writeFileXLSX(workbook, "PMU_CCES_Course_Difficulty_Ease_Report.xlsx");
   };
 
@@ -1616,10 +1532,10 @@ export default function GradeAnalysis() {
         </div>
         <div className="grade-ranking-controls">
           <label className="grade-minimum-students">Minimum Students per {reportMode === "course" ? "Course Group" : "Section"}<div><input type="number" min="1" value={minimumStudents} onChange={(e) => { setMinimumStudents(Number(e.target.value)); setReportGenerated(false); }} /><span>students</span></div></label>
-          {<label className="grade-minimum-students">{reportMode === "section" ? "Section & Instructor" : "Instructor"} Variation Threshold<div><input type="number" min="0" max="100" value={variationThreshold} onChange={(e) => { setVariationThreshold(Math.max(0, Number(e.target.value))); setReportGenerated(false); }} /><span>percentage points</span></div></label>}
+          {reportMode === "section" && <label className="grade-minimum-students">Section Variation Threshold<div><input type="number" min="0" max="100" value={variationThreshold} onChange={(e) => { setVariationThreshold(Math.max(0, Number(e.target.value))); setReportGenerated(false); }} /><span>percentage points</span></div></label>}
         </div>
         <div className="grade-criteria-note"><MiniIcon name="alert" /><span>Report results show both student counts and percentages. These illustrative rules are not official PMU academic standards.</span></div>
-        <div className="grade-report-action"><span>High range ≥ {aThreshold}{aType === "Percentage" ? "%" : " students"} · Low range ≥ {riskThreshold}{riskType === "Percentage" ? "%" : " students"} · Minimum {minimumStudents} students{` · Variation ≥ ${variationThreshold} pp`}</span><div><button className="grade-button grade-button--secondary" disabled={!reportGenerated} onClick={() => { setSelectedEmailCourses(emailReportCourses); setReviewEmailDrafts(false); setShowEmailPanel(true); }}><MiniIcon name="upload" /> Send report by email</button><button className="grade-button grade-button--primary" onClick={() => setReportGenerated(true)}><MiniIcon name="chart" /> Generate Report</button></div></div>
+        <div className="grade-report-action"><span>High range ≥ {aThreshold}{aType === "Percentage" ? "%" : " students"} · Low range ≥ {riskThreshold}{riskType === "Percentage" ? "%" : " students"} · Minimum {minimumStudents} students{reportMode === "section" ? ` · Variation ≥ ${variationThreshold} pp` : ""}</span><div><button className="grade-button grade-button--secondary" disabled={!reportGenerated} onClick={() => { setSelectedEmailCourses(emailReportCourses); setReviewEmailDrafts(false); setShowEmailPanel(true); }}><MiniIcon name="upload" /> Send report by email</button><button className="grade-button grade-button--primary" onClick={() => setReportGenerated(true)}><MiniIcon name="chart" /> Generate Report</button></div></div>
       </section>
       </div>
 
@@ -1638,16 +1554,6 @@ export default function GradeAnalysis() {
         {!reportPotentiallyDifficult.length && <div className="grade-review-empty"><MiniIcon name="check" /><span><strong>No courses meet the potentially difficult rule</strong>Adjust the criteria or broaden the filters to review another selection.</span></div>}
       </section>
 
-      <section className="grade-panel grade-report grade-detailed-summary">
-        <div className="grade-report-section-heading"><span>04</span><div><h2>Instructor Grade Variation</h2><p>Each instructor&apos;s sections of a course are totalled, then the highest and lowest instructors are compared on Combined A+/A and Combined D &amp; F (differences of {variationThreshold} percentage points or more; instructors with fewer than {minimumStudents} students are excluded).</p></div><b>{instructorVariations.length} findings</b></div>
-        <div className="grade-table-scroll"><table><thead><tr><th>Semester</th><th>Course</th><th>Course Name</th><th>Grade Measure</th><th>Highest Instructor</th><th>Lowest Instructor</th><th>Difference</th></tr></thead><tbody>{instructorVariations.map((item) => <tr key={`${item.semester}-${item.course}-${item.measure}`}><td>{semesterLabel(item.semester)}</td><td><strong>{item.course}</strong></td><td>{item.title}</td><td><strong>{item.measure}</strong></td><td>{item.highest.row.instructor} · {item.highest.row.sections} {item.highest.row.sections === 1 ? "section" : "sections"} · {item.highest.row.totalStudents} students · {item.highest.rate.toFixed(1)}%</td><td>{item.lowest.row.instructor} · {item.lowest.row.sections} {item.lowest.row.sections === 1 ? "section" : "sections"} · {item.lowest.row.totalStudents} students · {item.lowest.rate.toFixed(1)}%</td><td><span className="grade-gap">{item.difference.toFixed(1)} pp</span></td></tr>)}</tbody></table></div>
-        {!instructorVariations.length && <div className="grade-review-empty"><MiniIcon name="check" /><span><strong>No notable instructor variations</strong>No course has two instructors whose grade measures differ by {variationThreshold} percentage points or more.</span></div>}
-      </section>
-      <section className="grade-panel grade-report grade-detailed-summary">
-        <div className="grade-report-section-heading"><span>05</span><div><h2>Instructor Comparison</h2><p>Every instructor&apos;s sections of a course are totalled across the selected semesters. Each cell shows the number of students and the share of that instructor&apos;s own students (for example, how many A+ grades an instructor gave in a course across all of their sections).</p></div><b>{instructorGradeTable.length} rows</b></div>
-        <div className="grade-table-scroll"><table><thead><tr><th>Course</th><th>Instructor</th><th>Sections</th><th>Students</th>{grades.map((grade) => <th key={grade}>{comparisonGradeLabel(grade)}</th>)}</tr></thead><tbody>{instructorGradeTable.map((row) => <tr key={`${row.course}-${row.instructor}`}><td><strong>{row.course}</strong><br /><small>{row.title}</small></td><td>{row.instructor}</td><td>{row.sections}</td><td>{row.totalStudents}</td>{grades.map((grade) => <td key={grade}><strong>{row.grades[grade]}</strong> <small>({row.totalStudents ? (row.grades[grade] / row.totalStudents * 100).toFixed(1) : "0.0"}%)</small></td>)}</tr>)}</tbody></table></div>
-        {!instructorGradeTable.length && <div className="grade-review-empty"><MiniIcon name="check" /><span><strong>No grade records</strong>No sections match the current filters.</span></div>}
-      </section>
 
       </> : <>
       <section className="grade-panel grade-report grade-detailed-summary grade-signal-section--easy">
@@ -1662,16 +1568,6 @@ export default function GradeAnalysis() {
         <div className="grade-report-section-heading"><span>04</span><div><h2>Section Grade Variation Analysis</h2><p>Combined A+/A and Combined D &amp; F · highest-to-lowest differences of {variationThreshold} percentage points or more.</p></div><b>{notableSectionDifferences.length} findings</b></div>
         <div className="grade-table-scroll"><table><thead><tr><th>Semester</th><th>Course</th><th>Course Name</th><th>Grade Measure</th><th>Highest Section</th><th>Lowest Section</th><th>Difference</th></tr></thead><tbody>{notableSectionDifferences.map((item) => <tr key={`${item.semester}-${item.course}-${item.measure}`}><td>{semesterLabel(item.semester)}</td><td><strong>{item.course}</strong></td><td>{item.title}</td><td><strong>{item.measure}</strong></td><td>Section {item.highest.record.section} · {item.highest.record.campus} · {item.highest.record.totalStudents} students · {item.highest.rate.toFixed(1)}%</td><td>Section {item.lowest.record.section} · {item.lowest.record.campus} · {item.lowest.record.totalStudents} students · {item.lowest.rate.toFixed(1)}%</td><td><span className="grade-gap">{item.difference.toFixed(1)} pp</span></td></tr>)}</tbody></table></div>
         {!notableSectionDifferences.length && <div className="grade-review-empty"><MiniIcon name="check" /><span><strong>No notable section variations</strong>No grade measure differs by {variationThreshold} percentage points or more.</span></div>}
-      </section>
-      <section className="grade-panel grade-report grade-detailed-summary">
-        <div className="grade-report-section-heading"><span>05</span><div><h2>Instructor Grade Variation</h2><p>Each instructor&apos;s sections of a course are totalled, then the highest and lowest instructors are compared on Combined A+/A and Combined D &amp; F (differences of {variationThreshold} percentage points or more; instructors with fewer than {minimumStudents} students are excluded).</p></div><b>{instructorVariations.length} findings</b></div>
-        <div className="grade-table-scroll"><table><thead><tr><th>Semester</th><th>Course</th><th>Course Name</th><th>Grade Measure</th><th>Highest Instructor</th><th>Lowest Instructor</th><th>Difference</th></tr></thead><tbody>{instructorVariations.map((item) => <tr key={`${item.semester}-${item.course}-${item.measure}`}><td>{semesterLabel(item.semester)}</td><td><strong>{item.course}</strong></td><td>{item.title}</td><td><strong>{item.measure}</strong></td><td>{item.highest.row.instructor} · {item.highest.row.sections} {item.highest.row.sections === 1 ? "section" : "sections"} · {item.highest.row.totalStudents} students · {item.highest.rate.toFixed(1)}%</td><td>{item.lowest.row.instructor} · {item.lowest.row.sections} {item.lowest.row.sections === 1 ? "section" : "sections"} · {item.lowest.row.totalStudents} students · {item.lowest.rate.toFixed(1)}%</td><td><span className="grade-gap">{item.difference.toFixed(1)} pp</span></td></tr>)}</tbody></table></div>
-        {!instructorVariations.length && <div className="grade-review-empty"><MiniIcon name="check" /><span><strong>No notable instructor variations</strong>No course has two instructors whose grade measures differ by {variationThreshold} percentage points or more.</span></div>}
-      </section>
-      <section className="grade-panel grade-report grade-detailed-summary">
-        <div className="grade-report-section-heading"><span>06</span><div><h2>Instructor Comparison</h2><p>Every instructor&apos;s sections of a course are totalled across the selected semesters. Each cell shows the number of students and the share of that instructor&apos;s own students (for example, how many A+ grades an instructor gave in a course across all of their sections).</p></div><b>{instructorGradeTable.length} rows</b></div>
-        <div className="grade-table-scroll"><table><thead><tr><th>Course</th><th>Instructor</th><th>Sections</th><th>Students</th>{grades.map((grade) => <th key={grade}>{comparisonGradeLabel(grade)}</th>)}</tr></thead><tbody>{instructorGradeTable.map((row) => <tr key={`${row.course}-${row.instructor}`}><td><strong>{row.course}</strong><br /><small>{row.title}</small></td><td>{row.instructor}</td><td>{row.sections}</td><td>{row.totalStudents}</td>{grades.map((grade) => <td key={grade}><strong>{row.grades[grade]}</strong> <small>({row.totalStudents ? (row.grades[grade] / row.totalStudents * 100).toFixed(1) : "0.0"}%)</small></td>)}</tr>)}</tbody></table></div>
-        {!instructorGradeTable.length && <div className="grade-review-empty"><MiniIcon name="check" /><span><strong>No grade records</strong>No sections match the current filters.</span></div>}
       </section>
       </>}
       </>}
