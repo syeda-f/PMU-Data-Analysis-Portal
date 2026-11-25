@@ -619,7 +619,6 @@ export default function GradeAnalysis() {
   const [selectedSections, setSelectedSections] = useState<string[]>([]);
   const [comparisonGrades, setComparisonGrades] = useState<Grade[]>(() => [...grades]);
   const [chartInstructors, setChartInstructors] = useState<string[]>([]);
-  const [barGrouping, setBarGrouping] = useState<"section" | "instructor">("section");
   const [multiSemesterView, setMultiSemesterView] = useState<"lines" | "bars">("lines");
   const [aType, setAType] = useState<DisplayMode>("Percentage");
   const [aThreshold, setAThreshold] = useState(20);
@@ -957,21 +956,11 @@ export default function GradeAnalysis() {
   const notableSectionDifferences = allNotableSectionDifferences;
   // One row per instructor picked in the chart dropdown: all of that instructor's sections of the course are totalled.
   const barInstructorNames = activeChartInstructors.length ? activeChartInstructors : comparisonEnabled && multiSemesterView === "bars" ? chartInstructorOptions : [];
-  const instructorBarRows = useMemo<InstructorComparisonRow[]>(() => barGrouping === "section" ? barInstructorNames.flatMap((name) => gradeRecords.filter((record) =>
-    filters.semesters.includes(record.semester) &&
-    record.course === filters.course &&
-    (filters.campus === "All" || record.campus.startsWith(filters.campus)) &&
-    instructorMatches(record.instructor, name)
-  ).sort((x, y) => x.semester.localeCompare(y.semester) || x.section.localeCompare(y.section, undefined, { numeric: true })).map((record) => ({
-    instructor: `${barInstructorNames.length > 1 ? `${name} · ` : ""}${filters.semesters.length > 1 ? `${semesterLabel(record.semester)} · ` : ""}Sec ${record.section} · ${record.campus.replace(" Campus", "")}`,
-    sections: 1,
-    totalStudents: record.totalStudents,
-    grades: { ...record.grades },
-    isSection: true,
-  }))).map((row, index) => ({ ...row, color: instructorColors[index % instructorColors.length] })) : barInstructorNames.map((name) => {
-    const row: InstructorComparisonRow = { instructor: name, sections: 0, totalStudents: 0, grades: Object.fromEntries(allGrades.map((grade) => [grade, 0])) as Record<Grade, number> };
+  // One bar per semester for each picked instructor; all of that instructor's sections in the semester are combined.
+  const instructorBarRows = useMemo<InstructorComparisonRow[]>(() => barInstructorNames.flatMap((name) => [...filters.semesters].sort().map((semester) => {
+    const row: InstructorComparisonRow = { instructor: `${barInstructorNames.length > 1 ? `${name} · ` : ""}${semesterLabel(semester)}`, sections: 0, totalStudents: 0, grades: Object.fromEntries(allGrades.map((grade) => [grade, 0])) as Record<Grade, number> };
     gradeRecords.filter((record) =>
-      filters.semesters.includes(record.semester) &&
+      record.semester === semester &&
       record.course === filters.course &&
       (filters.campus === "All" || record.campus.startsWith(filters.campus)) &&
       instructorMatches(record.instructor, name)
@@ -981,7 +970,7 @@ export default function GradeAnalysis() {
       allGrades.forEach((grade) => { row.grades[grade] += record.grades[grade]; });
     });
     return row;
-  }).filter((row) => row.sections > 0), [barGrouping, barInstructorNames.join("|"), filters.campus, filters.course, filters.semesters, gradeRecords]);
+  })).filter((row) => row.sections > 0).map((row, index) => ({ ...row, color: instructorColors[index % instructorColors.length] })), [barInstructorNames.join("|"), filters.campus, filters.course, filters.semesters, gradeRecords]);
   // Bars (one per instructor, totalled over every selected semester) replace the line chart when picked in multi-semester view.
   const showInstructorBars = instructorBarRows.length > 0 && (!comparisonEnabled || multiSemesterView === "bars");
   const instructorVariations = useMemo(() => {
@@ -1444,7 +1433,7 @@ export default function GradeAnalysis() {
 
       <section className="grade-panel grade-chart-card">
         <div className="grade-card-heading">
-          <div><h2>{showInstructorBars ? `${filters.course} Grade Distribution by Instructor` : comparisonEnabled ? `${filters.course !== "All" ? filters.course : filters.instructor} Grade Distribution Across Semesters` : "Grade Distribution Across Letter Grades"}</h2>{comparisonEnabled && !showInstructorBars && <p>All matching sections are aggregated within each semester before percentages are calculated{activeChartInstructors.length ? ` · instructors: ${activeChartInstructors.join(", ")}` : ""}.</p>}{showInstructorBars && <p>{barGrouping === "section" ? "One bar per section the selected instructors taught; percentages are of each section's own students." : `All sections each instructor taught for this course${filters.semesters.length > 1 ? ` across the ${filters.semesters.length} selected semesters` : ""} are totalled; percentages are of that instructor's own students.`}</p>}</div>
+          <div><h2>{showInstructorBars ? `${filters.course} Grade Distribution by Instructor` : comparisonEnabled ? `${filters.course !== "All" ? filters.course : filters.instructor} Grade Distribution Across Semesters` : "Grade Distribution Across Letter Grades"}</h2>{comparisonEnabled && !showInstructorBars && <p>All matching sections are aggregated within each semester before percentages are calculated{activeChartInstructors.length ? ` · instructors: ${activeChartInstructors.join(", ")}` : ""}.</p>}{showInstructorBars && <p>One bar per semester; all sections the instructor taught that semester are combined. Percentages are of that semester&apos;s students.</p>}</div>
           <div className="grade-chart-actions">
             {filters.course !== "All" && chartInstructorOptions.length > 0 && <details className="grade-comparison-grade-filter">
               <summary>{activeChartInstructors.length ? `${activeChartInstructors.length} ${activeChartInstructors.length === 1 ? "instructor" : "instructors"}` : "All instructors"}</summary>
@@ -1454,7 +1443,6 @@ export default function GradeAnalysis() {
                 {chartInstructorOptions.map((name) => <label key={name}><input type="checkbox" checked={activeChartInstructors.includes(name)} onChange={() => setChartInstructors((current) => { const base = current.filter((value) => chartInstructorOptions.includes(value)); return base.includes(name) ? base.filter((value) => value !== name) : [...base, name]; })} /><i style={{ background: instructorColors[chartInstructorOptions.indexOf(name) % instructorColors.length] }} /><span>{name}</span></label>)}
               </div>
             </details>}
-            {showInstructorBars && <div className="grade-segment" role="tablist" aria-label="Bar grouping">{([["section", "By section"], ["instructor", "Instructor total"]] as const).map(([value, label]) => <button key={value} className={barGrouping === value ? "active" : ""} onClick={() => setBarGrouping(value)}>{label}</button>)}</div>}
             {comparisonEnabled && filters.course !== "All" && <div className="grade-segment" role="tablist" aria-label="Chart type">{([["lines", "Lines"], ["bars", "Bars (total)"]] as const).map(([value, label]) => <button key={value} className={multiSemesterView === value ? "active" : ""} onClick={() => setMultiSemesterView(value)}>{label}</button>)}</div>}
             {comparisonEnabled && !showInstructorBars && <details className="grade-comparison-grade-filter">
               <summary>{comparisonGrades.length} grade categories</summary>
