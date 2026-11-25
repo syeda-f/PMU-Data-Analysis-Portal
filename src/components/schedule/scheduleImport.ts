@@ -2,7 +2,7 @@ import * as XLSX from "xlsx";
 import { prerequisitePairs, type PrerequisitePair } from "./prerequisiteData";
 import { ccesCourseCatalog } from "./courseCatalogData";
 import { collegeProfessors } from "./collegeProfessors";
-import { blockConflictRules, type BlockConflictRule } from "./scheduleConstraintData";
+import { blockConflictRules, unmergedCcesCourseCatalog, type BlockConflictRule } from "./scheduleConstraintData";
 
 export type Campus = "Female" | "Male";
 export type ConflictType = "room" | "instructor" | "course" | "capacity" | "prerequisite" | "block";
@@ -105,9 +105,25 @@ export function normalizeCourseTitle(value: string) {
     .replace(/[^a-z0-9]/g, "");
 }
 
+function normalizeCatalogTitle(value: string) {
+  const normalized = normalizeCourseTitle(value);
+  const prefix = "learningoutcomeassessmentiii";
+  if (!normalized.startsWith(prefix)) return normalized;
+  const suffixAliases: Record<string, string> = {
+    ai: "aint",
+    coe: "coen",
+    cs: "cosc",
+    it: "itap",
+    se: "soen",
+  };
+  const suffix = normalized.slice(prefix.length);
+  return `${prefix}${suffixAliases[suffix] ?? suffix}`;
+}
+
 const catalogTitlesByCode = new Map<string, string[]>();
-ccesCourseCatalog.forEach((item) => {
-  catalogTitlesByCode.set(item.code, [...(catalogTitlesByCode.get(item.code) ?? []), item.title]);
+[...unmergedCcesCourseCatalog, ...ccesCourseCatalog].forEach((item) => {
+  const titles = catalogTitlesByCode.get(item.code) ?? [];
+  if (!titles.includes(item.title)) catalogTitlesByCode.set(item.code, [...titles, item.title]);
 });
 const professorNames = Object.values(collegeProfessors).flat();
 const professorNamesByNormalizedName = new Map(professorNames.map((name) => [name.trim().toLowerCase(), name]));
@@ -117,9 +133,9 @@ export function canonicalCourseTitle(code: string, title: string) {
   const options = catalogTitlesByCode.get(code);
   if (!options?.length) return title;
   if (options.length === 1) return options[0];
-  const normalized = normalizeCourseTitle(title);
+  const normalized = normalizeCatalogTitle(title);
   return options.find((option) => {
-    const candidate = normalizeCourseTitle(option);
+    const candidate = normalizeCatalogTitle(option);
     return candidate === normalized || candidate.includes(normalized) || normalized.includes(candidate);
   }) ?? title;
 }
@@ -348,7 +364,6 @@ export function mergeCrossListedCourses(courses: ScheduleCourse[]) {
   courses.forEach((course) => {
     const key = [
       course.gender,
-      course.section,
       normalizeCourseTitle(course.name),
       [...course.days].sort().join(","),
       course.startMinute,
@@ -358,18 +373,20 @@ export function mergeCrossListedCourses(courses: ScheduleCourse[]) {
     ].join("|");
     grouped.set(key, [...(grouped.get(key) ?? []), course]);
   });
-  return [...grouped.values()].map((records) => {
-    if (records.length === 1) return records[0];
+  return [...grouped.values()].flatMap((records) => {
     const first = records[0];
     const normalizedTitle = normalizeCourseTitle(first.name);
+    const mergedCode = CROSS_LISTED_CODES_BY_TITLE[normalizedTitle];
+    if (!mergedCode || new Set(records.map((record) => record.code)).size < 2) return records;
+    const available = records.reduce((sum, record) => sum + record.available, 0);
     return {
       ...first,
       id: records.map((record) => record.id).join(" / "),
-      code: CROSS_LISTED_CODES_BY_TITLE[normalizedTitle] ?? first.code,
+      code: mergedCode,
       maxEnrollment: records.reduce((sum, record) => sum + record.maxEnrollment, 0),
       enrolled: records.reduce((sum, record) => sum + record.enrolled, 0),
-      available: records.reduce((sum, record) => sum + record.available, 0),
-      status: records.some((record) => record.status === "Open") ? "Open" as const : "Closed" as const,
+      available,
+      status: available > 0 ? "Open" as const : "Closed" as const,
       conflicts: [...new Set(records.flatMap((record) => record.conflicts))],
       conflictDetails: [...new Set(records.flatMap((record) => record.conflictDetails ?? []))],
     };
@@ -387,6 +404,7 @@ export function findCrossListedGroups(courses: ScheduleCourse[]): CrossListedGro
       course.endMinute,
       course.room,
       course.instructor,
+      normalizeCourseTitle(course.name),
     ].join("|");
     grouped.set(key, [...(grouped.get(key) ?? []), course]);
   });
