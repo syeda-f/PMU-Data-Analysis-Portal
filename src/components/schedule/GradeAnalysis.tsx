@@ -99,6 +99,7 @@ const chartSeriesColor = (record: ChartSeries) => {
  * Source rows are additive grade groups, not duplicate copies.
  * Do not combine across semesters, courses or campuses.
  */
+// [MERGE] Combines duplicate rows of the SAME section (not the cross-list merge itself; that is done by the backend)
 function combineSectionGradeRows(records: SectionGradeRecord[]): SectionGradeRecord[] {
   const grouped = new Map<string, SectionGradeRecord>();
   const instructors = new Map<string, Set<string>>();
@@ -250,6 +251,7 @@ function backendToSection(record: BackendGradeRow): SectionGradeRecord {
   };
 }
 
+// [MERGE] API call for section-level rows (?merge=true|false)
 async function requestGradeSections(merged: boolean): Promise<SectionGradeRecord[]> {
   const response = await fetch(`${API_BASE}/api/grades?merge=${merged}&record_type=section`);
   if (!response.ok) {
@@ -260,6 +262,7 @@ async function requestGradeSections(merged: boolean): Promise<SectionGradeRecord
   return rows.map(backendToSection);
 }
 
+// [MERGE] API call for course-level rows (?merge=true|false)
 async function requestGradeCourses(merged: boolean): Promise<SectionGradeRecord[]> {
   const response = await fetch(`${API_BASE}/api/grades?merge=${merged}&record_type=course`);
   if (!response.ok) throw new Error(`Unable to load course grades (${response.status}).`);
@@ -598,8 +601,10 @@ function CohortChart({ initialRecord, initialMode }: { initialRecord: GradeRecor
 
 export default function GradeAnalysis() {
   // Cross-listed courses are merged by default; the hero button toggles the original view.
+  // [MERGE] State: merged by default; isMerging = button loading state
   const [mergeEnabled, setMergeEnabled] = useState(true);
   const [isMerging, setIsMerging] = useState(false);
+  // [MERGE] Initial bundled data is combined too
   const [gradeRecords, setGradeRecords] = useState<SectionGradeRecord[]>(() => combineSectionGradeRows(sectionGradeData.map(uniformGradeRecord)).filter((record) => CCES_DEPARTMENTS.has(record.department.toUpperCase())));
   const [activePanel, setActivePanel] = useState<"analysis" | "report">("analysis");
   const [courseGradeRecords, setCourseGradeRecords] = useState<SectionGradeRecord[]>([]);
@@ -614,6 +619,7 @@ export default function GradeAnalysis() {
   const [selectedSections, setSelectedSections] = useState<string[]>([]);
   const [comparisonGrades, setComparisonGrades] = useState<Grade[]>(() => [...grades]);
   const [chartInstructors, setChartInstructors] = useState<string[]>([]);
+  const [multiSemesterView, setMultiSemesterView] = useState<"lines" | "bars">("lines");
   const [aType, setAType] = useState<DisplayMode>("Percentage");
   const [aThreshold, setAThreshold] = useState(20);
   const [riskType, setRiskType] = useState<DisplayMode>("Percentage");
@@ -652,6 +658,7 @@ export default function GradeAnalysis() {
 
   const applyRecords = (records: SectionGradeRecord[], courseRows?: SectionGradeRecord[]) => {
     if (courseRows) setCourseGradeRecords(courseRows.filter((record) => CCES_DEPARTMENTS.has(record.department.toUpperCase())));
+    // [MERGE] Combines duplicate cross-listed rows when new records are applied
     const nextRecords = combineSectionGradeRows(records.map(uniformGradeRecord)).filter((record) => CCES_DEPARTMENTS.has(record.department.toUpperCase()));
     setGradeRecords(nextRecords);
     setSelectedSections([]);
@@ -668,6 +675,7 @@ export default function GradeAnalysis() {
 
   useEffect(() => {
     let cancelled = false;
+    // [MERGE] Initial load: fetches sections + courses with merge=mergeEnabled
     Promise.all([requestGradeSections(mergeEnabled), requestGradeCourses(mergeEnabled)])
       .then(([records, courseRows]) => {
         if (cancelled) return;
@@ -679,6 +687,7 @@ export default function GradeAnalysis() {
     return () => { cancelled = true; };
   }, [mergeEnabled]);
 
+  // [MERGE] Toggle handler: loads merged or original data from the API, then updates mergeEnabled
   const handleMergeCrossListed = async () => {
     if (isMerging || isImporting) return;
     setIsMerging(true);
@@ -719,6 +728,7 @@ export default function GradeAnalysis() {
         }
       }
       if (result.imported.length) {
+        // [MERGE] Re-fetch after a CSV import using the current merge state
         const [records, courseRows] = await Promise.all([requestGradeSections(mergeEnabled), requestGradeCourses(mergeEnabled)]);
         applyRecords(records, courseRows);
         const importedSemesters = [...new Set(result.imported.map((item) => item.semester))];
@@ -959,6 +969,8 @@ export default function GradeAnalysis() {
     });
     return row;
   }).filter((row) => row.sections > 0), [activeChartInstructors, filters.campus, filters.course, filters.semesters, gradeRecords]);
+  // Bars (one per instructor, totalled over every selected semester) replace the line chart when picked in multi-semester view.
+  const showInstructorBars = instructorBarRows.length > 0 && (!comparisonEnabled || multiSemesterView === "bars");
   const instructorVariations = useMemo(() => {
     const byCourse = new Map<string, SectionGradeRecord[]>();
     sections.forEach((record) => {
@@ -986,6 +998,19 @@ export default function GradeAnalysis() {
       }).filter((item) => item.difference >= variationThreshold);
     }).sort((a, b) => b.difference - a.difference);
   }, [sections, variationThreshold, minimumStudents]);
+  // Instructor Comparison: every instructor's sections of a course are totalled across the selected semesters, with a count per grade.
+  const instructorGradeTable = useMemo(() => {
+    const groups = new Map<string, { course: string; title: string; instructor: string; sections: number; totalStudents: number; grades: Record<Grade, number> }>();
+    sections.forEach((record) => {
+      const key = `${record.course}|${record.instructor}`;
+      const row = groups.get(key) ?? { course: record.course, title: record.title, instructor: record.instructor, sections: 0, totalStudents: 0, grades: Object.fromEntries(allGrades.map((grade) => [grade, 0])) as Record<Grade, number> };
+      row.sections += 1;
+      row.totalStudents += record.totalStudents;
+      allGrades.forEach((grade) => { row.grades[grade] += record.grades[grade]; });
+      groups.set(key, row);
+    });
+    return [...groups.values()].sort((a, b) => a.course.localeCompare(b.course) || a.instructor.localeCompare(b.instructor));
+  }, [sections]);
   const topPerformingSections = useMemo(() => sections.filter((record) => {
     const count = gradeRangeCount(record, highGradeRange);
     const value = aType === "Percentage" ? percent(count, record) : count;
@@ -1135,7 +1160,12 @@ export default function GradeAnalysis() {
     `Instructor Grade Variation >= ${variationThreshold} percentage points (${instructorVariations.length})`,
     ...instructorVariations.map((item) => `${semesterLabel(item.semester)} | ${item.course} - ${item.title} | ${item.measure}: ${item.difference.toFixed(1)} pp | ${item.highest.row.instructor} (${item.highest.row.sections} sections, ${item.highest.row.totalStudents} students) ${item.highest.rate.toFixed(1)}% vs ${item.lowest.row.instructor} (${item.lowest.row.sections} sections, ${item.lowest.row.totalStudents} students) ${item.lowest.rate.toFixed(1)}%`),
   ];
-  const reportLines = reportMode === "course" ? [...courseReportLines, ...instructorVariationLines] : [...sectionReportLines, ...instructorVariationLines];
+  const instructorComparisonLines = [
+    "",
+    `Instructor Comparison (${instructorGradeTable.length} instructor-course rows, totalled across the selected semesters)`,
+    ...instructorGradeTable.map((row) => `${row.course} - ${row.title} | ${row.instructor} | ${row.sections} sections, ${row.totalStudents} students | ${grades.map((grade) => `${comparisonGradeLabel(grade)} ${row.grades[grade]} (${row.totalStudents ? (row.grades[grade] / row.totalStudents * 100).toFixed(1) : "0.0"}%)`).join(", ")}`),
+  ];
+  const reportLines = reportMode === "course" ? [...courseReportLines, ...instructorVariationLines, ...instructorComparisonLines] : [...sectionReportLines, ...instructorVariationLines, ...instructorComparisonLines];
 
   const exportExcel = () => {
     const workbook = XLSX.utils.book_new();
@@ -1157,6 +1187,19 @@ export default function GradeAnalysis() {
       { Setting: "Low-performance Sections to Display", Value: atRiskSectionCount },
       { Setting: "Section Variation Threshold", Value: variationThreshold, Type: "Percentage Points" },
     ]), "Criteria");
+    const appendInstructorComparisonSheet = () => {
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(instructorGradeTable.map((row) => ({
+        Course: row.course,
+        "Course Name": row.title,
+        Instructor: row.instructor,
+        Sections: row.sections,
+        Students: row.totalStudents,
+        ...Object.fromEntries(grades.flatMap((grade) => [
+          [`${comparisonGradeLabel(grade)} Count`, row.grades[grade]],
+          [`${comparisonGradeLabel(grade)} %`, row.totalStudents ? row.grades[grade] / row.totalStudents : 0],
+        ])),
+      }))), "Instructor Comparison");
+    };
     const appendInstructorVariationSheet = () => {
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(instructorVariations.map((item) => ({
         Semester: semesterLabel(item.semester),
@@ -1213,6 +1256,7 @@ export default function GradeAnalysis() {
         "Lowest Percentage": item.lowest.rate / 100,
       }))), "Notable Differences");
       appendInstructorVariationSheet();
+      appendInstructorComparisonSheet();
       XLSX.writeFileXLSX(workbook, "PMU_CCES_Section_Grade_Analysis_Report.xlsx");
       return;
     }
@@ -1247,6 +1291,7 @@ export default function GradeAnalysis() {
       };
     })), "Low Performance");
     appendInstructorVariationSheet();
+    appendInstructorComparisonSheet();
     XLSX.writeFileXLSX(workbook, "PMU_CCES_Course_Difficulty_Ease_Report.xlsx");
   };
 
@@ -1342,6 +1387,7 @@ export default function GradeAnalysis() {
           <p>Analyze grades and compare course records across campuses.</p>
         </div>
         <div className="grade-hero-buttons">
+          {/* [MERGE] Header button: toggles merged / original cross-listed courses */}
           <button className="grade-button grade-button--secondary grade-merge-action" disabled={isMerging || isImporting} onClick={() => void handleMergeCrossListed()}>
             {isMerging ? <span className="grade-button-spinner" aria-hidden="true" /> : <MiniIcon name="sections" />}
             {isMerging ? "Loading…" : mergeEnabled ? "Show Original Courses" : "Merge Cross-Listed Courses"}
@@ -1385,7 +1431,7 @@ export default function GradeAnalysis() {
 
       <section className="grade-panel grade-chart-card">
         <div className="grade-card-heading">
-          <div><h2>{comparisonEnabled ? `${filters.course !== "All" ? filters.course : filters.instructor} Grade Distribution Across Semesters` : instructorBarRows.length ? `${filters.course} Grade Distribution by Instructor` : "Grade Distribution Across Letter Grades"}</h2>{comparisonEnabled && <p>All matching sections are aggregated within each semester before percentages are calculated{activeChartInstructors.length ? ` · instructors: ${activeChartInstructors.join(", ")}` : ""}.</p>}{!comparisonEnabled && instructorBarRows.length > 0 && <p>All sections each instructor taught for this course are totalled; percentages are of that instructor&apos;s own students.</p>}</div>
+          <div><h2>{showInstructorBars ? `${filters.course} Grade Distribution by Instructor` : comparisonEnabled ? `${filters.course !== "All" ? filters.course : filters.instructor} Grade Distribution Across Semesters` : "Grade Distribution Across Letter Grades"}</h2>{comparisonEnabled && !showInstructorBars && <p>All matching sections are aggregated within each semester before percentages are calculated{activeChartInstructors.length ? ` · instructors: ${activeChartInstructors.join(", ")}` : ""}.</p>}{showInstructorBars && <p>All sections each instructor taught for this course{filters.semesters.length > 1 ? ` across the ${filters.semesters.length} selected semesters` : ""} are totalled; percentages are of that instructor&apos;s own students.</p>}</div>
           <div className="grade-chart-actions">
             {filters.course !== "All" && chartInstructorOptions.length > 0 && <details className="grade-comparison-grade-filter">
               <summary>{activeChartInstructors.length ? `${activeChartInstructors.length} ${activeChartInstructors.length === 1 ? "instructor" : "instructors"}` : "All instructors"}</summary>
@@ -1395,7 +1441,8 @@ export default function GradeAnalysis() {
                 {chartInstructorOptions.map((name) => <label key={name}><input type="checkbox" checked={activeChartInstructors.includes(name)} onChange={() => setChartInstructors((current) => { const base = current.filter((value) => chartInstructorOptions.includes(value)); return base.includes(name) ? base.filter((value) => value !== name) : [...base, name]; })} /><i style={{ background: instructorColors[chartInstructorOptions.indexOf(name) % instructorColors.length] }} /><span>{name}</span></label>)}
               </div>
             </details>}
-            {comparisonEnabled && <details className="grade-comparison-grade-filter">
+            {comparisonEnabled && activeChartInstructors.length > 0 && <div className="grade-segment" role="tablist" aria-label="Chart type">{([["lines", "Lines"], ["bars", "Bars (total)"]] as const).map(([value, label]) => <button key={value} className={multiSemesterView === value ? "active" : ""} onClick={() => setMultiSemesterView(value)}>{label}</button>)}</div>}
+            {comparisonEnabled && !showInstructorBars && <details className="grade-comparison-grade-filter">
               <summary>{comparisonGrades.length} grade categories</summary>
               <div>
                 <strong>Display grades</strong>
@@ -1406,9 +1453,9 @@ export default function GradeAnalysis() {
           </div>
         </div>
         {filters.semesters.length >= 2 && !comparisonEnabled && <p role="status">Choose a course or instructor to compare grade distributions across the selected semesters.</p>}
-        {comparisonEnabled ? <>
+        {comparisonEnabled && !showInstructorBars ? <>
                     <SemesterComparisonChart data={semesterComparison} mode={filters.mode} selectedGrades={comparisonGrades} course={filters.course !== "All" ? filters.course : filters.instructor} />
-        </> : instructorBarRows.length > 0 ? <InstructorBarsChart rows={instructorBarRows} allNames={chartInstructorOptions} mode={filters.mode} course={filters.course} /> : <>
+        </> : showInstructorBars ? <InstructorBarsChart rows={instructorBarRows} allNames={chartInstructorOptions} mode={filters.mode} course={filters.course} /> : <>
           <div className="grade-chart-legend grade-chart-legend--single-line">{chartSeries.map((section) => <span key={chartSeriesKey(section)}><i style={{ background: chartSeriesColor(section) }} /><b>{section.course} · Sec {section.section}</b></span>)}</div>
           <div className="grade-chart-wrap">
             <span className="grade-y-label">{filters.mode}</span>
@@ -1594,6 +1641,11 @@ export default function GradeAnalysis() {
         <div className="grade-table-scroll"><table><thead><tr><th>Semester</th><th>Course</th><th>Course Name</th><th>Grade Measure</th><th>Highest Instructor</th><th>Lowest Instructor</th><th>Difference</th></tr></thead><tbody>{instructorVariations.map((item) => <tr key={`${item.semester}-${item.course}-${item.measure}`}><td>{semesterLabel(item.semester)}</td><td><strong>{item.course}</strong></td><td>{item.title}</td><td><strong>{item.measure}</strong></td><td>{item.highest.row.instructor} · {item.highest.row.sections} {item.highest.row.sections === 1 ? "section" : "sections"} · {item.highest.row.totalStudents} students · {item.highest.rate.toFixed(1)}%</td><td>{item.lowest.row.instructor} · {item.lowest.row.sections} {item.lowest.row.sections === 1 ? "section" : "sections"} · {item.lowest.row.totalStudents} students · {item.lowest.rate.toFixed(1)}%</td><td><span className="grade-gap">{item.difference.toFixed(1)} pp</span></td></tr>)}</tbody></table></div>
         {!instructorVariations.length && <div className="grade-review-empty"><MiniIcon name="check" /><span><strong>No notable instructor variations</strong>No course has two instructors whose grade measures differ by {variationThreshold} percentage points or more.</span></div>}
       </section>
+      <section className="grade-panel grade-report grade-detailed-summary">
+        <div className="grade-report-section-heading"><span>05</span><div><h2>Instructor Comparison</h2><p>Every instructor&apos;s sections of a course are totalled across the selected semesters. Each cell shows the number of students and the share of that instructor&apos;s own students (for example, how many A+ grades an instructor gave in a course across all of their sections).</p></div><b>{instructorGradeTable.length} rows</b></div>
+        <div className="grade-table-scroll"><table><thead><tr><th>Course</th><th>Instructor</th><th>Sections</th><th>Students</th>{grades.map((grade) => <th key={grade}>{comparisonGradeLabel(grade)}</th>)}</tr></thead><tbody>{instructorGradeTable.map((row) => <tr key={`${row.course}-${row.instructor}`}><td><strong>{row.course}</strong><br /><small>{row.title}</small></td><td>{row.instructor}</td><td>{row.sections}</td><td>{row.totalStudents}</td>{grades.map((grade) => <td key={grade}><strong>{row.grades[grade]}</strong> <small>({row.totalStudents ? (row.grades[grade] / row.totalStudents * 100).toFixed(1) : "0.0"}%)</small></td>)}</tr>)}</tbody></table></div>
+        {!instructorGradeTable.length && <div className="grade-review-empty"><MiniIcon name="check" /><span><strong>No grade records</strong>No sections match the current filters.</span></div>}
+      </section>
 
       </> : <>
       <section className="grade-panel grade-report grade-detailed-summary grade-signal-section--easy">
@@ -1613,6 +1665,11 @@ export default function GradeAnalysis() {
         <div className="grade-report-section-heading"><span>05</span><div><h2>Instructor Grade Variation</h2><p>Each instructor&apos;s sections of a course are totalled, then the highest and lowest instructors are compared on Combined A+/A and Combined D &amp; F (differences of {variationThreshold} percentage points or more; instructors with fewer than {minimumStudents} students are excluded).</p></div><b>{instructorVariations.length} findings</b></div>
         <div className="grade-table-scroll"><table><thead><tr><th>Semester</th><th>Course</th><th>Course Name</th><th>Grade Measure</th><th>Highest Instructor</th><th>Lowest Instructor</th><th>Difference</th></tr></thead><tbody>{instructorVariations.map((item) => <tr key={`${item.semester}-${item.course}-${item.measure}`}><td>{semesterLabel(item.semester)}</td><td><strong>{item.course}</strong></td><td>{item.title}</td><td><strong>{item.measure}</strong></td><td>{item.highest.row.instructor} · {item.highest.row.sections} {item.highest.row.sections === 1 ? "section" : "sections"} · {item.highest.row.totalStudents} students · {item.highest.rate.toFixed(1)}%</td><td>{item.lowest.row.instructor} · {item.lowest.row.sections} {item.lowest.row.sections === 1 ? "section" : "sections"} · {item.lowest.row.totalStudents} students · {item.lowest.rate.toFixed(1)}%</td><td><span className="grade-gap">{item.difference.toFixed(1)} pp</span></td></tr>)}</tbody></table></div>
         {!instructorVariations.length && <div className="grade-review-empty"><MiniIcon name="check" /><span><strong>No notable instructor variations</strong>No course has two instructors whose grade measures differ by {variationThreshold} percentage points or more.</span></div>}
+      </section>
+      <section className="grade-panel grade-report grade-detailed-summary">
+        <div className="grade-report-section-heading"><span>06</span><div><h2>Instructor Comparison</h2><p>Every instructor&apos;s sections of a course are totalled across the selected semesters. Each cell shows the number of students and the share of that instructor&apos;s own students (for example, how many A+ grades an instructor gave in a course across all of their sections).</p></div><b>{instructorGradeTable.length} rows</b></div>
+        <div className="grade-table-scroll"><table><thead><tr><th>Course</th><th>Instructor</th><th>Sections</th><th>Students</th>{grades.map((grade) => <th key={grade}>{comparisonGradeLabel(grade)}</th>)}</tr></thead><tbody>{instructorGradeTable.map((row) => <tr key={`${row.course}-${row.instructor}`}><td><strong>{row.course}</strong><br /><small>{row.title}</small></td><td>{row.instructor}</td><td>{row.sections}</td><td>{row.totalStudents}</td>{grades.map((grade) => <td key={grade}><strong>{row.grades[grade]}</strong> <small>({row.totalStudents ? (row.grades[grade] / row.totalStudents * 100).toFixed(1) : "0.0"}%)</small></td>)}</tr>)}</tbody></table></div>
+        {!instructorGradeTable.length && <div className="grade-review-empty"><MiniIcon name="check" /><span><strong>No grade records</strong>No sections match the current filters.</span></div>}
       </section>
       </>}
       </>}
