@@ -169,13 +169,11 @@ function courseBelongsToCollege(code: string, college: string, title = "") {
   );
 }
 
-// Department filter = course prefix: ITAP -> only ITAP courses, several departments -> their union.
-// For CCES, ASSE courses count under the major named in their title and CSEC counts as CYSC.
-function departmentMatchesCourse(course: Course, departments: string[], ccesMode: boolean) {
-  if (departments.length === 0) return true;
-  if (!ccesMode) return departments.includes(getCourseParts(course.code).prefix);
-  const department = getCcesColorPrefix(course);
-  return departments.some((selected) => (selected === "CSEC" ? "CYSC" : selected) === department);
+function isCcesCatalogCourse(course: Course) {
+  const canonicalTitle = normalizeCourseTitle(canonicalCourseTitle(course.code, course.name));
+  return unmergedCcesCourseCatalog.some(
+    (item) => item.code === course.code && normalizeCourseTitle(item.title) === canonicalTitle
+  );
 }
 
 function keepValidSelections(current: string[], options: readonly string[]) {
@@ -985,9 +983,13 @@ export default function App() {
     () => new Set(selectedElectiveRows.map((item) => item.code)),
     [selectedElectiveRows]
   );
+  const analysisCourses = useMemo(
+    () => mergeCrossListed ? mergeCrossListedCourses(courses) : courses,
+    [courses, mergeCrossListed]
+  );
   const filteredCourses = useMemo(
     () =>
-      scheduleViewCourses.filter((course) => {
+      analysisCourses.filter((course) => {
         const query = search.trim().toLowerCase();
         const { prefix, numeric } = getCourseParts(course.code);
         const ccesRows = ccesCourseCatalog.filter((item) => (mergeCrossListed ? canonicalScheduleCode(item.code) : item.code) === course.code);
@@ -1009,7 +1011,7 @@ export default function App() {
             (!isElective || configCategories.Electives));
         return (
           (colleges.length === 0 || colleges.some((college) => courseBelongsToCollege(course.code, college, course.name))) &&
-          (!ccesSelected || ccesRows.length > 0 || isElective) &&
+          (!ccesSelected || isCcesCatalogCourse(course) || isElective) &&
           (campusTab === "All" || course.gender === campusTab) &&
           types.includes(course.roomType) &&
           (departments.length === 0 || (ccesSelected ? isMajorCourse : departments.includes(prefix))) &&
@@ -1030,7 +1032,7 @@ export default function App() {
           (!query || `${course.id} ${course.code} ${course.code.split(" ")[0]} ${course.name} ${course.instructor} ${course.room}`.toLowerCase().includes(query))
         );
       }),
-    [activeCcesCatalog, campusTab, colleges, configuredCourses, configCategories, courseNames, departments, instructors, levels, numericCodes, prefixes, rooms, search, selectedCcesMajors, selectedElectiveCodes, statuses, timeSlots, types, scheduleViewCourses]
+    [activeCcesCatalog, analysisCourses, campusTab, colleges, configuredCourses, configCategories, courseNames, departments, instructors, levels, numericCodes, prefixes, rooms, search, selectedCcesMajors, selectedElectiveCodes, statuses, timeSlots, types]
   );
   const conflictReportDepartmentOptions = useMemo(() => {
     if (conflictReportColleges.length === 0) {
@@ -1173,8 +1175,8 @@ export default function App() {
     const escapeCsv = (value: string | number) => `"${String(value).replace(/"/g, "\"\"")}"`;
     downloadBlob(new Blob([rows.map((row) => row.map(escapeCsv).join(",")).join("\n")], { type: "text/csv;charset=utf-8" }), `${filename}.csv`);
   };
-  const exportCampusSchedule = (campus: Campus) => {
-    const rows = courses.filter((course) => course.gender === campus).map((course) => ({
+  const createScheduleRows = (source: ScheduleCourse[], campus: Campus) =>
+    source.filter((course) => course.gender === campus).map((course) => ({
       "TERM CODE": "202710",
       CRN: course.id,
       "CAMP CODE": campus === "Female" ? "F1" : "M1",
@@ -1195,9 +1197,23 @@ export default function App() {
       ROOM: course.room,
       Instructor: course.instructor,
     }));
+  const exportCampusSchedule = (campus: Campus) => {
+    const rows = createScheduleRows(courses, campus);
     const workbook = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(rows), `${campus} Schedule`);
     XLSX.writeFileXLSX(workbook, `Course_202710_${campus === "Female" ? "F1" : "M1"}_updated.xlsx`);
+  };
+  const exportMergedSchedules = () => {
+    const mergedCourses = mergeCrossListedCourses(courses);
+    const workbook = XLSX.utils.book_new();
+    (["Male", "Female"] as const).forEach((campus) => {
+      XLSX.utils.book_append_sheet(
+        workbook,
+        XLSX.utils.json_to_sheet(createScheduleRows(mergedCourses, campus)),
+        `${campus} Merged`
+      );
+    });
+    XLSX.writeFileXLSX(workbook, "Course_202710_Merged_Schedules.xlsx");
   };
 
   const slotCourses = (slot: number) =>
@@ -1254,28 +1270,13 @@ export default function App() {
 
   const courseOptionPool = useMemo(
     () =>
-      scheduleViewCourses.filter(
+      analysisCourses.filter(
         (course) =>
           (campusTab === "All" || course.gender === campusTab) &&
           (colleges.length === 0 || colleges.some((college) => courseBelongsToCollege(course.code, college, course.name))) &&
-          (!colleges.includes("CCES") || activeCcesCatalog.some((item) => (mergeCrossListed ? canonicalScheduleCode(item.code) : item.code) === course.code) || selectedElectiveCodes.has(course.code))
+          (!colleges.includes("CCES") || isCcesCatalogCourse(course) || selectedElectiveCodes.has(course.code))
       ),
-    [campusTab, colleges, scheduleViewCourses, activeCcesCatalog, selectedElectiveCodes, mergeCrossListed]
-  );
-  // The Department list itself always uses the full pool. Every other dropdown is narrowed
-  // to the selected departments, then further to the selected prefixes / codes.
-  const departmentScopedPool = useMemo(() => {
-    if (departments.length === 0) return courseOptionPool;
-    const ccesMode = colleges.includes("CCES") || departments.some((department) => CCES_MAJORS.includes(department as CcesMajor));
-    return courseOptionPool.filter((course) => departmentMatchesCourse(course, departments, ccesMode));
-  }, [courseOptionPool, departments, colleges]);
-  const refinedPool = useMemo(
-    () => departmentScopedPool.filter((course) => {
-      const { prefix, numeric } = getCourseParts(course.code);
-      return (prefixes.length === 0 || prefixes.includes(prefix)) &&
-        (numericCodes.length === 0 || numericCodes.includes(numeric));
-    }),
-    [departmentScopedPool, prefixes, numericCodes]
+    [analysisCourses, campusTab, colleges, selectedElectiveCodes]
   );
   const courseDepartments = useMemo(
     () => colleges.includes("CCES")
@@ -1675,6 +1676,7 @@ export default function App() {
                 <FileImport label="Female schedule" campus="Female" onImport={handleImport} />
                 <button className="import-button export-schedule-button" disabled={!userAddedSections} onClick={() => exportCampusSchedule("Male")}><span className="import-icon"><Icon name="fileText" size={15} /></span><span><strong>Export male schedule</strong><small>{userAddedSections ? "Includes user-added sections" : "Add a section to enable"}</small></span></button>
                 <button className="import-button export-schedule-button" disabled={!userAddedSections} onClick={() => exportCampusSchedule("Female")}><span className="import-icon"><Icon name="fileText" size={15} /></span><span><strong>Export female schedule</strong><small>{userAddedSections ? "Includes user-added sections" : "Add a section to enable"}</small></span></button>
+                <button className="import-button export-schedule-button" onClick={exportMergedSchedules}><span className="import-icon"><Icon name="fileText" size={15} /></span><span><strong>Export merged schedules</strong><small>Male and female merged sheets</small></span></button>
               </div>
             </section>
 
@@ -1915,16 +1917,7 @@ export default function App() {
                 </label>
                 <label className="conflict-toggle">
                   <input type="checkbox" checked={mergeCrossListed} onChange={(event) => {
-                    const checked = event.target.checked;
-                    const nextCatalog = checked ? ccesCourseCatalog : unmergedCcesCourseCatalog;
-                    setMergeCrossListed(checked);
-                    setConfiguredCourses(Array.from(new Set([
-                      ...nextCatalog
-                        .filter((item) => selectedCcesMajors.length === 0 || selectedCcesMajors.some((major) => item.majors.includes(major)))
-                        .map((item) => item.code),
-                      ...selectedElectiveRows.map((item) => item.code),
-                    ])));
-                    setConfigCategories({ MATH: true, GEIT: true, Electives: true });
+                    setMergeCrossListed(event.target.checked);
                   }} />
                   <span className="toggle-track"><i></i></span>
                   Merge cross-listed
