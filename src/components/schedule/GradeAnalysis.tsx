@@ -2,9 +2,8 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import * as XLSX from "xlsx";
 import { type Grade, type GradeRecord } from "./gradeData";
 import { sectionGradeData, type SectionGradeRecord } from "./sectionGradeData";
-import { collegeProfessors, findProfessorEmail } from "./collegeProfessors";
+import { collegeProfessors } from "./collegeProfessors";
 import { canonicalCourseTitle } from "./scheduleImport";
-import { openOutlookDraft } from "@/lib/outlook-draft";
 
 type DisplayMode = "Student Count" | "Percentage";
 type ReportMode = "course" | "section";
@@ -640,13 +639,6 @@ export default function GradeAnalysis() {
 
 
   const [toast, setToast] = useState<{ type: "success" | "error" | "info"; message: string } | null>(null);
-  const [showEmailPanel, setShowEmailPanel] = useState(false);
-  const [selectedEmailCourses, setSelectedEmailCourses] = useState<string[]>([]);
-  const [reviewEmailDrafts, setReviewEmailDrafts] = useState(false);
-  const [chairEmails, setChairEmails] = useState("mkhan@pmu.edu.sa, sabdulrahman@pmu.edu.sa, nmohammad@pmu.edu.sa");
-  const [senderEmail, setSenderEmail] = useState("mkhan@pmu.edu.sa");
-  const [sendingEmails, setSendingEmails] = useState(false);
-  const [emailAttachment, setEmailAttachment] = useState<"pdf" | "csv">("pdf");
   const importInputRef = useRef<HTMLInputElement>(null);
   const toastTimerRef = useRef<number | null>(null);
 
@@ -868,6 +860,13 @@ export default function GradeAnalysis() {
     });
   }, [activeChartInstructors, comparisonEnabled, filters.campus, filters.course, filters.department, filters.instructor, filters.semesters, gradeRecords, semesterOptions]);
   const selectedSemesterLabels = filters.semesters.map(semesterLabel).join(", ");
+  // Unique download name per report view, semester(s) and campus, e.g. PMU_CCES_By-Course_202510_Female
+  const reportFileBase = () => {
+    const terms = [...filters.semesters].sort();
+    const termPart = terms.length <= 3 ? terms.join("-") : `${terms[0]}-to-${terms[terms.length - 1]}_${terms.length}-semesters`;
+    const campusPart = filters.campus === "All" ? "All-Campuses" : filters.campus.replace(/\s*Campus$/i, "") + "-Campus";
+    return `PMU_CCES_${reportMode === "course" ? "By-Course" : "By-Section"}_${termPart || "No-Semester"}_${campusPart}`.replace(/[^A-Za-z0-9_.-]/g, "-");
+  };
 
   const rankedCourses = useMemo(() => {
     const grouped = new Map<string, ChartSeries>();
@@ -986,101 +985,12 @@ export default function GradeAnalysis() {
     return record.totalStudents >= minimumStudents && value >= riskThreshold;
   }).sort((a, b) => percent(gradeRangeCount(b, lowGradeRange), b) - percent(gradeRangeCount(a, lowGradeRange), a))
     .slice(0, atRiskSectionCount), [atRiskSectionCount, lowGradeRange, minimumStudents, riskThreshold, riskType, sections]);
-  const emailReportCourses = useMemo(() => {
-    const records = reportMode === "course"
-      ? [...reportPotentiallyEasy.slice(0, topCourseCount), ...reportPotentiallyDifficult.slice(0, atRiskCourseCount)]
-      : [...topPerformingSections, ...atRiskSections];
-    return [...new Set(records.map((record) => record.course))].sort();
-  }, [atRiskCourseCount, atRiskSections, reportMode, reportPotentiallyDifficult, reportPotentiallyEasy, topCourseCount, topPerformingSections]);
-  const reportFileName = (course: string) => `${course.replace(/\s+/g, "_")}_Grade_Report.${emailAttachment}`;
-  const buildReportFile = (course: string, lines: string[], courseSections: SectionGradeRecord[]) => {
-    // Wrap long lines so they stay inside the PDF page width.
-    if (emailAttachment === "pdf") return createPdfBlob(lines.flatMap((line) => line.match(/.{1,90}(?:\s|$)/g)?.map((part) => part.trim()) ?? [line]));
-    const escape = (value: string | number) => `"${String(value).replace(/"/g, '""')}"`;
-    const header = ["Semester", "Course", "Title", "Section", "Campus", "Instructor", "Total Students", ...allGrades, "Passing Rate", "Failing Rate", "Withdrawal Rate"];
-    const rows = courseSections.map((record) => [semesterLabel(record.semester), record.course, record.title, record.section, record.campus, record.instructor, record.totalStudents, ...allGrades.map((grade) => record.grades[grade]), passingRate(record).toFixed(1) + "%", failingRate(record).toFixed(1) + "%", withdrawalRateOf(record).toFixed(1) + "%"]);
-    // BOM so Excel opens the CSV as UTF-8.
-    return new Blob(["\ufeff" + [header, ...rows].map((row) => row.map(escape).join(",")).join("\r\n")], { type: "text/csv;charset=utf-8" });
-  };
-  const buildCourseEmail = (course: string) => {
-    const courseSections = sections.filter((record) => record.course === course);
-    const instructors = [...new Set(courseSections.map((record) => record.instructor))];
-    const missingRecipients = instructors.filter((instructor) => !findProfessorEmail(instructor));
-    const recipients = [...new Set(instructors.flatMap((instructor) => {
-      const email = findProfessorEmail(instructor);
-      return email ? [email] : [];
-    }))];
-    const highFlag = reportPotentiallyEasy.some((record) => record.course === course) || topPerformingSections.some((record) => record.course === course);
-    const lowFlag = reportPotentiallyDifficult.some((record) => record.course === course) || atRiskSections.some((record) => record.course === course);
-    const details = courseSections.map((record) => {
-      const breakdown = allGrades.map((grade) => `${grade}: ${record.grades[grade]}`).join(", ");
-      return `Section ${record.section} — ${record.instructor} — ${record.totalStudents} students\n${breakdown}`;
-    }).join("\n\n");
-    return {
-      course,
-      to: recipients,
-      missingRecipients,
-      subject: `${course} Grade Distribution Review`,
-      body: `Report flag: ${[highFlag ? "High average performance" : "", lowFlag ? "Low average performance" : ""].filter(Boolean).join(" and ")}\n\nCourse: ${course} — ${courseSections[0]?.title ?? ""}\nInstructors: ${instructors.join(", ")}\n\nThe grade breakdown by section is in the attached ${emailAttachment.toUpperCase()} report: ${reportFileName(course)}.`,
-      reportLines: [`PMU - CCES`, `Grade Distribution Review: ${course} — ${courseSections[0]?.title ?? ""}`, `Semesters: ${selectedSemesterLabels}`, `Report flag: ${[highFlag ? "High average performance" : "", lowFlag ? "Low average performance" : ""].filter(Boolean).join(" and ")}`, "", ...courseSections.flatMap((record) => [`Section ${record.section} (${record.campus}) — ${record.instructor} — ${record.totalStudents} students`, allGrades.map((grade) => `${grade}: ${record.grades[grade]} (${percent(record.grades[grade], record).toFixed(1)}%)`).join(", "), outcomeSplit(record), ""])],
-      sections: courseSections,
-    };
-  };
-  const sendReportEmails = async () => {
-    setSendingEmails(true);
-    try {
-      const cc = chairEmails.split(/[;,]/).map((email) => email.trim()).filter(Boolean);
-      const drafts = selectedEmailCourses.map(buildCourseEmail);
-      const unresolved = drafts.flatMap((draft) => draft.missingRecipients);
-      if (unresolved.length) {
-        throw new Error(`No directory email found for: ${[...new Set(unresolved)].join(", ")}.`);
-      }
-      const messages = drafts.map(({ course, to, subject, body }) => ({ course, to, subject, body, cc }));
-      const response = await fetch("/api/send-report", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages }) });
-      const result = await response.json() as { error?: string; sent?: number };
-      if (!response.ok) throw new Error(result.error ?? "Unable to send report emails.");
-      showToast("success", `${result.sent ?? messages.length} report emails sent successfully.`);
-      setShowEmailPanel(false);
-    } catch (error) {
-      showToast("error", error instanceof Error ? error.message : "Unable to send report emails.");
-    } finally {
-      setSendingEmails(false);
-    }
-  };
-  const openReportDrafts = async () => {
-    const cc = chairEmails.split(/[;,]/).map((email) => email.trim()).filter(Boolean);
-    const drafts = selectedEmailCourses.map(buildCourseEmail);
-    const unresolved = drafts.flatMap((draft) => draft.missingRecipients);
-    if (unresolved.length) {
-      showToast("error", `No directory email found for: ${[...new Set(unresolved)].join(", ")}.`);
-      return;
-    }
-    // Outlook on the web does not reliably honour the CC parameter, so also put the CC list on the
-    // clipboard. Copy first: the clipboard needs the click's user activation, which window.open keeps.
-    let copied = false;
-    try {
-      await navigator.clipboard.writeText(cc.join("; "));
-      copied = true;
-    } catch { /* Clipboard may be unavailable. */ }
-    // Outlook compose links cannot carry attachments, so each report file is downloaded
-    // and has to be attached to its draft (drag it in from Downloads).
-    let opened = 0;
-    for (const [index, draft] of drafts.entries()) {
-      const { to, subject, body, course, reportLines, sections: courseSections } = draft;
-      window.setTimeout(() => downloadBlob(buildReportFile(course, reportLines, courseSections), reportFileName(course)), index * 500);
-      if (openOutlookDraft({ to, cc, subject, body })) opened++;
-    }
-    if (opened < drafts.length) {
-      showToast("error", `Opened ${opened} of ${drafts.length} drafts. Allow pop-ups for this site, then try again.`);
-    } else {
-      showToast("success", `${opened} Outlook draft${opened === 1 ? "" : "s"} opened and ${drafts.length} ${emailAttachment.toUpperCase()} file${drafts.length === 1 ? "" : "s"} downloaded: attach each file to its draft.${copied && cc.length ? " CC list copied: if CC is empty, paste it into the CC box." : ""}`);
-    }
-  };
   const toggleSort = (key: typeof sortKey) => {
     if (sortKey === key) setSortAsc(!sortAsc);
     else { setSortKey(key); setSortAsc(true); }
   };
 
+  const reportDistribution = (record: GradeRecord) => grades.map((grade) => `${gradeLabels[grade as Exclude<Grade, "P">]} ${record.grades[grade]} (${percent(record.grades[grade], record).toFixed(1)}%)`).join(" · ");
   const courseReportLines = [
     "PMU - CCES",
     "Course Difficulty & Ease Analysis Report",
@@ -1091,12 +1001,15 @@ export default function GradeAnalysis() {
     `Minimum students per course group: ${minimumStudents}`,
     "",
     `Courses with High Average Performance (${Math.min(reportPotentiallyEasy.length, topCourseCount)})`,
-    ...reportPotentiallyEasy.slice(0, topCourseCount).map((record) => `${semesterLabel(record.semester)} | ${record.course} - ${record.title} | Instructor: ${instructorsForCourse(record.course, record.semester)} | ${gradeRangeCount(record, highGradeRange)} of ${record.totalStudents} students (${percent(gradeRangeCount(record, highGradeRange), record).toFixed(1)}%) in ${highGradeRange.join(", ")} | ${outcomeSplit(record)}`),
+    ...reportPotentiallyEasy.slice(0, topCourseCount).map((record) => {
+      const count = gradeRangeCount(record, highGradeRange);
+      return `${semesterLabel(record.semester)} | ${record.course} — ${record.title} | Instructor: ${instructorsForCourse(record.course, record.semester)} | Selected Grade Range Outcome: ${count} of ${record.totalStudents} students (${percent(count, record).toFixed(1)}%) | Pass / Fail / Withdraw: ${outcomeSplit(record)} | Grade Distribution: ${reportDistribution(record)}`;
+    }),
     "",
     `Courses with Low Average Performance (${Math.min(reportPotentiallyDifficult.length, atRiskCourseCount)})`,
     ...reportPotentiallyDifficult.slice(0, atRiskCourseCount).map((record) => {
       const lowGradeCount = gradeRangeCount(record, lowGradeRange);
-      return `${semesterLabel(record.semester)} | ${record.course} - ${record.title} | Instructor: ${instructorsForCourse(record.course, record.semester)} | ${lowGradeCount} of ${record.totalStudents} (${percent(lowGradeCount, record).toFixed(1)}%) in ${lowGradeRange.join(", ")} | Passing: ${passingGrades(record)} of ${record.totalStudents} (${passingRate(record).toFixed(1)}%) | Failing: ${failingGrades(record)} of ${record.totalStudents} (${failingRate(record).toFixed(1)}%) | Withdrawal: ${record.grades.W} of ${record.totalStudents} (${percent(record.grades.W, record).toFixed(1)}%) | Grade Distribution: ${grades.map((grade) => `${grade}: ${record.grades[grade]}`).join(", ")}`;
+      return `${semesterLabel(record.semester)} | ${record.course} — ${record.title} | Instructor: ${instructorsForCourse(record.course, record.semester)} | Selected Grade Range Outcome: ${lowGradeCount} of ${record.totalStudents} students (${percent(lowGradeCount, record).toFixed(1)}%) | Passing Outcome: ${passingGrades(record)} of ${record.totalStudents} (${passingRate(record).toFixed(1)}%) | Failing Outcome: ${failingGrades(record)} of ${record.totalStudents} (${failingRate(record).toFixed(1)}%) | Withdrawal Outcome: ${record.grades.W} of ${record.totalStudents} (${percent(record.grades.W, record).toFixed(1)}%) | Grade Distribution: ${reportDistribution(record)}`;
     }),
     "",
     "These configurable rules are illustrative and are not official PMU academic standards.",
@@ -1108,10 +1021,10 @@ export default function GradeAnalysis() {
     `Filters: Semesters ${selectedSemesterLabels}; Department ${filters.department}; Course ${filters.course}; Instructor ${filters.instructor}; Campus ${filters.campus}; Sections ${selectedSections.length ? selectedSections.length : "All"}`,
     "",
     `Sections with High Average Performance (${topPerformingSections.length})`,
-    ...topPerformingSections.map((record, index) => `${index + 1}. ${semesterLabel(record.semester)} | ${record.course} - ${record.title} | Section ${record.section} | ${record.instructor} | ${record.totalStudents} students | Selected range ${percent(gradeRangeCount(record, highGradeRange), record).toFixed(1)}%`),
+    ...topPerformingSections.map((record, index) => { const count = gradeRangeCount(record, highGradeRange); return `#${index + 1} | ${semesterLabel(record.semester)} | ${record.course} · Section ${record.section} | ${record.title} | Instructor: ${record.instructor} | Students: ${record.totalStudents} | Selected Grade Range Outcome: ${count} of ${record.totalStudents} (${percent(count, record).toFixed(1)}%)`; }),
     "",
     `Sections with Low Average Performance (${atRiskSections.length})`,
-    ...atRiskSections.map((record, index) => `${index + 1}. ${semesterLabel(record.semester)} | ${record.course} - ${record.title} | Section ${record.section} | ${record.instructor} | ${record.totalStudents} students | Selected range ${percent(gradeRangeCount(record, lowGradeRange), record).toFixed(1)}%`),
+    ...atRiskSections.map((record, index) => { const count = gradeRangeCount(record, lowGradeRange); return `#${index + 1} | ${semesterLabel(record.semester)} | ${record.course} · Section ${record.section} | ${record.title} | Instructor: ${record.instructor} | Students: ${record.totalStudents} | Selected Grade Range Outcome: ${count} of ${record.totalStudents} (${percent(count, record).toFixed(1)}%)`; }),
     "",
     "Variation measures: Combined A+/A and Combined D & F",
     `Section Grade Variation Analysis >= ${variationThreshold} percentage points (${notableSectionDifferences.length})`,
@@ -1120,97 +1033,75 @@ export default function GradeAnalysis() {
   const reportLines = reportMode === "course" ? courseReportLines : sectionReportLines;
 
   const exportExcel = () => {
-    const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet([
-      { Setting: "College", Value: "CCES" },
-      { Setting: "Report View", Value: reportMode === "course" ? "By Course" : "By Section" },
-      { Setting: "Semesters", Value: selectedSemesterLabels },
-      { Setting: "Department", Value: filters.department },
-      { Setting: "Course", Value: filters.course },
-      { Setting: "Instructor", Value: filters.instructor },
-      { Setting: "Campus", Value: filters.campus },
-      { Setting: "Sections", Value: selectedSections.length ? selectedSections.length : "All Sections" },
-      { Setting: "High Average Performance Threshold", Value: aThreshold, Type: aType },
-      { Setting: "Low Average Performance Threshold", Value: riskThreshold, Type: riskType },
-      { Setting: "Minimum Students", Value: minimumStudents },
-      { Setting: "High-performance Courses to Display", Value: topCourseCount },
-      { Setting: "Low-performance Courses to Display", Value: atRiskCourseCount },
-      { Setting: "High-performance Sections to Display", Value: topSectionCount },
-      { Setting: "Low-performance Sections to Display", Value: atRiskSectionCount },
-      { Setting: "Section Variation Threshold", Value: variationThreshold, Type: "Percentage Points" },
-    ]), "Criteria");
-    if (reportMode === "section") {
-      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(topPerformingSections.map((record, index) => ({
-        Rank: index + 1,
-        Semester: semesterLabel(record.semester),
-        Course: record.course,
-        "Course Name": record.title,
-        Section: record.section,
-        Instructor: record.instructor,
-        Students: record.totalStudents,
-        "A/A+ Count": highGrades(record),
-        "A/A+ Percentage": percent(highGrades(record), record) / 100,
-      }))), "Top Sections");
-      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(atRiskSections.map((record, index) => ({
-        Rank: index + 1,
-        Semester: semesterLabel(record.semester),
-        Course: record.course,
-        "Course Name": record.title,
-        Section: record.section,
-        Instructor: record.instructor,
-        Students: record.totalStudents,
-        "D+ & Below Count": record.grades["D+"] + record.grades["D&Below"],
-        "D+ & Below Rate": percent(record.grades["D+"] + record.grades["D&Below"], record) / 100,
-      }))), "At Risk Sections");
-      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(notableSectionDifferences.map((item) => ({
+    const isCourseView = reportMode === "course";
+    const distributionText = (record: GradeRecord) => grades.map((grade) => `${gradeLabels[grade as Exclude<Grade, "P">]} ${record.grades[grade]} (${percent(record.grades[grade], record).toFixed(1)}%)`).join(" · ");
+    type Cell = string | number;
+    const rows: Cell[][] = [];
+    const block = (title: string, subtitle: string, table: Record<string, Cell>[]) => {
+      rows.push([], [title], [subtitle]);
+      if (!table.length) { rows.push(["No records meet this rule for the current filters."]); return; }
+      const headers = Object.keys(table[0]);
+      rows.push(headers, ...table.map((row) => headers.map((header) => row[header])));
+    };
+    rows.push([isCourseView ? "PMU - CCES · Course Difficulty & Ease Analysis Report" : "PMU - CCES · Section-Level Grade Analysis Report"]);
+    rows.push(["Filters", `Semesters: ${selectedSemesterLabels} | Department: ${filters.department} | Course: ${filters.course} | Instructor: ${filters.instructor} | Campus: ${filters.campus}${isCourseView ? "" : ` | Sections: ${selectedSections.length ? selectedSections.length : "All"}`}`]);
+    rows.push(["Criteria", `High range threshold: ${aThreshold}${aType === "Percentage" ? "%" : " students"} | Low range threshold: ${riskThreshold}${riskType === "Percentage" ? "%" : " students"} | Minimum students: ${minimumStudents}${isCourseView ? "" : ` | Section variation: ${variationThreshold} pp`}`]);
+    if (isCourseView) {
+      block("Courses with High Average Performance", "Courses meeting the configured grade-range threshold.", reportPotentiallyEasy.slice(0, topCourseCount).map((record) => {
+        const count = gradeRangeCount(record, highGradeRange);
+        return {
+          Semester: semesterLabel(record.semester),
+          Course: `${record.course} — ${record.title}`,
+          Instructor: instructorsForCourse(record.course, record.semester),
+          "Selected Grade Range Outcome": `${count} of ${record.totalStudents} students (${percent(count, record).toFixed(1)}%)`,
+          "Pass / Fail / Withdraw": outcomeSplit(record),
+          "Grade Distribution": distributionText(record),
+        };
+      }));
+      block("Courses with Low Average Performance", "Courses meeting the configured low-performance grade range.", reportPotentiallyDifficult.slice(0, atRiskCourseCount).map((record) => {
+        const lowGradeCount = gradeRangeCount(record, lowGradeRange);
+        return {
+          Semester: semesterLabel(record.semester),
+          Course: `${record.course} — ${record.title}`,
+          Instructor: instructorsForCourse(record.course, record.semester),
+          "Selected Grade Range Outcome": `${lowGradeCount} of ${record.totalStudents} students (${percent(lowGradeCount, record).toFixed(1)}%)`,
+          "Passing Outcome": `${passingGrades(record)} of ${record.totalStudents} (${passingRate(record).toFixed(1)}%)`,
+          "Failing Outcome": `${failingGrades(record)} of ${record.totalStudents} (${failingRate(record).toFixed(1)}%)`,
+          "Withdrawal Outcome": `${record.grades.W} of ${record.totalStudents} (${percent(record.grades.W, record).toFixed(1)}%)`,
+          "Grade Distribution": distributionText(record),
+        };
+      }));
+    } else {
+      const sectionRow = (record: SectionGradeRecord, index: number, rangeGrades: GradeRangeOption[]) => {
+        const count = gradeRangeCount(record, rangeGrades);
+        return {
+          Rank: index + 1,
+          Semester: semesterLabel(record.semester),
+          "Course / Section": `${record.course} · Section ${record.section}`,
+          "Course Name": record.title,
+          Instructor: record.instructor,
+          Students: record.totalStudents,
+          "Selected Grade Range Outcome": `${count} of ${record.totalStudents} (${percent(count, record).toFixed(1)}%)`,
+        };
+      };
+      block("Sections with High Average Performance", "Sections meeting the configured grade-range threshold.", topPerformingSections.map((record, index) => sectionRow(record, index, highGradeRange)));
+      block("Sections with Low Average Performance", "Sections meeting the configured low-performance grade range.", atRiskSections.map((record, index) => sectionRow(record, index, lowGradeRange)));
+      block("Section Grade Variation Analysis", `Combined A+/A and Combined D & F · differences of ${variationThreshold} percentage points or more.`, notableSectionDifferences.map((item) => ({
         Semester: semesterLabel(item.semester),
         Course: item.course,
         "Course Name": item.title,
         "Grade Measure": item.measure,
-        "Difference (percentage points)": item.difference,
-        "Highest Section": item.highest.record.section,
-        "Highest Campus": item.highest.record.campus,
-        "Highest Section Students": item.highest.record.totalStudents,
-        "Highest Percentage": item.highest.rate / 100,
-        "Lowest Section": item.lowest.record.section,
-        "Lowest Campus": item.lowest.record.campus,
-        "Lowest Section Students": item.lowest.record.totalStudents,
-        "Lowest Percentage": item.lowest.rate / 100,
-      }))), "Notable Differences");
-      XLSX.writeFileXLSX(workbook, "PMU_CCES_Section_Grade_Analysis_Report.xlsx");
-      return;
+        "Highest Section": `Section ${item.highest.record.section} · ${item.highest.record.campus} · ${item.highest.record.totalStudents} students · ${item.highest.rate.toFixed(1)}%`,
+        "Lowest Section": `Section ${item.lowest.record.section} · ${item.lowest.record.campus} · ${item.lowest.record.totalStudents} students · ${item.lowest.rate.toFixed(1)}%`,
+        Difference: `${item.difference.toFixed(1)} pp`,
+      })));
     }
-    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(reportPotentiallyEasy.map((record) => ({
-      Semester: semesterLabel(record.semester),
-      Department: record.department,
-      Course: record.course,
-      Title: record.title,
-      Instructor: instructorsForCourse(record.course, record.semester),
-      Students: record.totalStudents,
-      "A/A+ Count": highGrades(record),
-      "A/A+ Rate": percent(highGrades(record), record) / 100,
-      "Passing Rate": passingRate(record) / 100,
-      "Failing Rate": failingRate(record) / 100,
-      "Withdrawal Rate": withdrawalRateOf(record) / 100,
-      ...record.grades,
-    }))), "High Performance");
-    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(reportPotentiallyDifficult.map((record) => {
-      const lowGradeCount = record.grades["D+"] + record.grades["D&Below"];
-      return {
-        Department: record.department,
-        Course: record.course,
-        Title: record.title,
-        Instructor: instructorsForCourse(record.course, record.semester),
-        Students: record.totalStudents,
-        "D+ & Below Count": lowGradeCount,
-        "D+ & Below Rate": percent(lowGradeCount, record) / 100,
-        "Passing Rate": passingRate(record) / 100,
-        "Failing Rate": failingRate(record) / 100,
-        "Withdrawal Rate": percent(record.grades.W, record) / 100,
-        ...record.grades,
-      };
-    })), "Low Performance");
-    XLSX.writeFileXLSX(workbook, "PMU_CCES_Course_Difficulty_Ease_Report.xlsx");
+    const sheet = XLSX.utils.aoa_to_sheet(rows);
+    const widest = rows.reduce<number[]>((widths, row) => { row.forEach((cell, index) => { widths[index] = Math.max(widths[index] ?? 10, Math.min(60, String(cell).length + 2)); }); return widths; }, []);
+    sheet["!cols"] = widest.map((wch, index) => ({ wch: index === 0 ? Math.min(wch, 30) : wch }));
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, sheet, "Report");
+    XLSX.writeFileXLSX(workbook, `${reportFileBase()}.xlsx`);
   };
 
   const switchPanel = (next: "analysis" | "report") => {
@@ -1422,7 +1313,7 @@ export default function GradeAnalysis() {
         </div>
         <div className="grade-report-hero__meta">
           <span className="grade-report-scope">{selectedCourseCount} courses · {sections.length} sections · {studentTotal.toLocaleString()} students</span>
-          <div className="grade-export-block"><span>{reportGenerated ? "Download generated report" : "Generate the report to enable downloads"}</span><div className="grade-export-actions"><button className="grade-button grade-button--secondary" disabled={!reportGenerated} onClick={() => downloadBlob(createPdfBlob(reportLines), reportMode === "course" ? "PMU_CCES_Course_Difficulty_Ease_Report.pdf" : "PMU_CCES_Section_Grade_Analysis_Report.pdf")}><MiniIcon name="download" /> PDF</button><button className="grade-button grade-button--secondary" disabled={!reportGenerated} onClick={exportExcel}><MiniIcon name="download" /> Excel</button><button className="grade-button grade-button--secondary" disabled={!reportGenerated} onClick={() => downloadBlob(createDocxBlob(reportLines), reportMode === "course" ? "PMU_CCES_Course_Difficulty_Ease_Report.docx" : "PMU_CCES_Section_Grade_Analysis_Report.docx")}><MiniIcon name="download" /> DOCX</button></div></div>
+          <div className="grade-export-block"><span>{reportGenerated ? "Download generated report" : "Generate the report to enable downloads"}</span><div className="grade-export-actions"><button className="grade-button grade-button--secondary" disabled={!reportGenerated} onClick={() => downloadBlob(createPdfBlob(reportLines), `${reportFileBase()}.pdf`)}><MiniIcon name="download" /> PDF</button><button className="grade-button grade-button--secondary" disabled={!reportGenerated} onClick={exportExcel}><MiniIcon name="download" /> Excel</button><button className="grade-button grade-button--secondary" disabled={!reportGenerated} onClick={() => downloadBlob(createDocxBlob(reportLines), `${reportFileBase()}.docx`)}><MiniIcon name="download" /> DOCX</button></div></div>
         </div>
       </section>
       <div className="grade-report-controls">
@@ -1535,7 +1426,7 @@ export default function GradeAnalysis() {
           {reportMode === "section" && <label className="grade-minimum-students">Section Variation Threshold<div><input type="number" min="0" max="100" value={variationThreshold} onChange={(e) => { setVariationThreshold(Math.max(0, Number(e.target.value))); setReportGenerated(false); }} /><span>percentage points</span></div></label>}
         </div>
         <div className="grade-criteria-note"><MiniIcon name="alert" /><span>Report results show both student counts and percentages. These illustrative rules are not official PMU academic standards.</span></div>
-        <div className="grade-report-action"><span>High range ≥ {aThreshold}{aType === "Percentage" ? "%" : " students"} · Low range ≥ {riskThreshold}{riskType === "Percentage" ? "%" : " students"} · Minimum {minimumStudents} students{reportMode === "section" ? ` · Variation ≥ ${variationThreshold} pp` : ""}</span><div><button className="grade-button grade-button--secondary" disabled={!reportGenerated} onClick={() => { setSelectedEmailCourses(emailReportCourses); setReviewEmailDrafts(false); setShowEmailPanel(true); }}><MiniIcon name="upload" /> Send report by email</button><button className="grade-button grade-button--primary" onClick={() => setReportGenerated(true)}><MiniIcon name="chart" /> Generate Report</button></div></div>
+        <div className="grade-report-action"><span>High range ≥ {aThreshold}{aType === "Percentage" ? "%" : " students"} · Low range ≥ {riskThreshold}{riskType === "Percentage" ? "%" : " students"} · Minimum {minimumStudents} students{reportMode === "section" ? ` · Variation ≥ ${variationThreshold} pp` : ""}</span><div><button className="grade-button grade-button--primary" onClick={() => setReportGenerated(true)}><MiniIcon name="chart" /> Generate Report</button></div></div>
       </section>
       </div>
 
@@ -1572,22 +1463,6 @@ export default function GradeAnalysis() {
       </>}
       </>}
       </>}
-      {showEmailPanel && <div className="grade-email-backdrop" onMouseDown={() => setShowEmailPanel(false)}>
-        <aside className="grade-email-drawer" onMouseDown={(event) => event.stopPropagation()}>
-          <div className="grade-email-head"><div><span>Email delivery</span><h2>Send grade reports</h2><p>Select courses and review each email draft here before sending.</p></div><button onClick={() => setShowEmailPanel(false)} aria-label="Close">×</button></div>
-          {!reviewEmailDrafts ? <>
-            <label className="grade-email-field">Sender<input value={senderEmail} onChange={(event) => setSenderEmail(event.target.value)} /></label>
-            <label className="grade-email-field">Department chairs (CC)<textarea value={chairEmails} onChange={(event) => setChairEmails(event.target.value)} rows={3} /></label>
-            <label className="grade-email-field">Report attachment<select value={emailAttachment} onChange={(event) => setEmailAttachment(event.target.value as "pdf" | "csv")}><option value="pdf">PDF report</option><option value="csv">CSV (opens in Excel)</option></select></label>
-            <div className="grade-email-course-list">{emailReportCourses.map((course) => <label key={course}><input type="checkbox" checked={selectedEmailCourses.includes(course)} onChange={() => setSelectedEmailCourses((current) => current.includes(course) ? current.filter((item) => item !== course) : [...current, course])} /><span><strong>{course}</strong><small>{sections.find((record) => record.course === course)?.title}</small></span></label>)}</div>
-            <button className="grade-button grade-button--primary" disabled={!selectedEmailCourses.length} onClick={() => setReviewEmailDrafts(true)}>Review {selectedEmailCourses.length} email {selectedEmailCourses.length === 1 ? "draft" : "drafts"}</button>
-          </> : <>
-            <button className="grade-email-back" onClick={() => setReviewEmailDrafts(false)}>Edit draft settings</button>
-            <div className="grade-email-drafts">{selectedEmailCourses.map((course) => { const draft = buildCourseEmail(course); return <article key={course}><div><strong>{draft.subject}</strong><small>To: {draft.to.join(", ") || "No directory email found"}</small>{draft.missingRecipients.length > 0 && <small>Missing: {draft.missingRecipients.join(", ")}</small>}<small>CC: {chairEmails}</small><small>Attachment: {reportFileName(course)}</small></div><pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{draft.body}</pre></article>; })}</div>
-            <button className="grade-button grade-button--primary" disabled={selectedEmailCourses.length === 0 || selectedEmailCourses.some((course) => buildCourseEmail(course).missingRecipients.length > 0)} onClick={openReportDrafts}>{`Open ${selectedEmailCourses.length} ${selectedEmailCourses.length === 1 ? "draft" : "drafts"} in Outlook`}</button>
-          </>}
-        </aside>
-      </div>}
     </div>
   );
 }
